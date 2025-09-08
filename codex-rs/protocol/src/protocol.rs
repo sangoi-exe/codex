@@ -161,6 +161,17 @@ pub enum Op {
     /// The agent will use its existing context (either conversation history or previous response id)
     /// to generate a summary which will be returned as an AgentMessage event.
     Compact,
+
+    /// Preview compaction impact without altering history. Prints an estimated
+    /// token delta and suggested percent remaining.
+    CompactDryRun,
+
+    /// Pin the most recent assistant/user message that still carries a provider id.
+    /// Useful for retention during subsequent compaction steps.
+    PinLast,
+
+    /// Remove all pinned message ids for the current session.
+    UnpinAll,
     /// Request to shut down codex instance.
     Shutdown,
 }

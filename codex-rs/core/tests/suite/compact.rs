@@ -249,3 +249,122 @@ async fn summarize_context_three_requests_and_instructions() {
         "third request should not include the summarize trigger"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pinned_message_survives_compaction() {
+    if std::env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+        println!(
+            "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
+        );
+        return;
+    }
+
+    let server = MockServer::start().await;
+
+    let sse1 = sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed("r1"),
+    ]);
+    let sse2 = sse(vec![
+        ev_assistant_message("m2", SUMMARY_TEXT),
+        ev_completed("r2"),
+    ]);
+    let sse3 = sse(vec![ev_completed("r3")]);
+
+    // Request 1: initial chat
+    let first_matcher = |req: &wiremock::Request| {
+        let body = std::str::from_utf8(&req.body).unwrap_or("");
+        body.contains("\"text\":\"hello world\"")
+            && !body.contains(&format!("\"text\":\"{SUMMARIZE_TRIGGER}\""))
+    };
+    mount_sse_once(&server, first_matcher, sse1).await;
+
+    // Request 2: summarization
+    let second_matcher = |req: &wiremock::Request| {
+        let body = std::str::from_utf8(&req.body).unwrap_or("");
+        body.contains(&format!("\"text\":\"{SUMMARIZE_TRIGGER}\""))
+    };
+    mount_sse_once(&server, second_matcher, sse2).await;
+
+    // Request 3: post-compact turn
+    let third_matcher = |req: &wiremock::Request| {
+        let body = std::str::from_utf8(&req.body).unwrap_or("");
+        // Must include the pinned assistant reply and the new user input.
+        body.contains(FIRST_REPLY) && body.contains(THIRD_USER_MSG)
+    };
+    mount_sse_once(&server, third_matcher, sse3).await;
+
+    // Build config pointing to the mock server and spawn Codex.
+    let model_provider = ModelProviderInfo {
+        base_url: Some(format!("{}/v1", server.uri())),
+        ..built_in_model_providers()["openai"].clone()
+    };
+    let home = TempDir::new().unwrap();
+    let mut config = load_default_config_for_test(&home);
+    config.model_provider = model_provider;
+    let conversation_manager = ConversationManager::with_auth(CodexAuth::from_api_key("dummy"));
+    let codex = conversation_manager
+        .new_conversation(config)
+        .await
+        .unwrap()
+        .conversation;
+
+    // 1) Normal user input – should hit server once and record assistant reply (with id).
+    codex
+        .submit(Op::UserInput {
+            items: vec![InputItem::Text {
+                text: "hello world".into(),
+            }],
+        })
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+
+    // Pin the last message (assistant m1)
+    codex.submit(Op::PinLast).await.unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::AgentMessage(_))).await;
+
+    // 2) Summarize/compact
+    codex.submit(Op::Compact).await.unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+
+    // 3) Next user input – third hit
+    codex
+        .submit(Op::UserInput {
+            items: vec![InputItem::Text {
+                text: THIRD_USER_MSG.into(),
+            }],
+        })
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3, "expected exactly three requests");
+
+    // Verify third request contains the pinned assistant text and the new user message.
+    let body3 = requests[2].body_json::<serde_json::Value>().unwrap();
+    let input3 = body3.get("input").and_then(|v| v.as_array()).unwrap();
+    let mut has_pinned_assistant = false;
+    let mut has_new_user = false;
+    for item in input3 {
+        if item["type"].as_str() == Some("message") {
+            let role = item["role"].as_str().unwrap_or_default();
+            let text = item["content"][0]["text"].as_str().unwrap_or_default();
+            if role == "assistant" && text.contains(FIRST_REPLY) {
+                has_pinned_assistant = true;
+            }
+            if role == "user" && text.contains(THIRD_USER_MSG) {
+                has_new_user = true;
+            }
+        }
+    }
+    assert!(
+        has_pinned_assistant,
+        "pinned assistant message not preserved after compaction"
+    );
+    assert!(
+        has_new_user,
+        "new user message not present in third request"
+    );
+}

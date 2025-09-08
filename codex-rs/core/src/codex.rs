@@ -263,6 +263,8 @@ struct State {
     pending_input: Vec<ResponseInputItem>,
     history: ConversationHistory,
     token_info: Option<TokenUsageInfo>,
+    /// Provider message ids that are pinned and should be preserved by compaction.
+    pinned_message_ids: std::collections::HashSet<String>,
 }
 
 /// Context for an initialized model agent
@@ -1315,6 +1317,98 @@ async fn submission_loop(
                     sess.set_task(task);
                 }
             }
+            Op::CompactDryRun => {
+                // Estimate before/after without changing history.
+                let model_context_window = turn_context.client.get_model_context_window();
+
+                // Snapshot current items and pins.
+                let (items, pins): (Vec<ResponseItem>, std::collections::HashSet<String>) = {
+                    let st = sess.state.lock_unchecked();
+                    (st.history.contents(), st.pinned_message_ids.clone())
+                };
+                let before_estimate = crate::estimate_tokens_for_items(&items);
+
+                // Simulate compaction: tail(1) + pinned messages from pre-compaction items.
+                let pinned_messages: Vec<ResponseItem> = if pins.is_empty() {
+                    Vec::new()
+                } else {
+                    items
+                        .iter()
+                        .filter_map(|ri| match ri {
+                            ResponseItem::Message { id: Some(id), .. } if pins.contains(id) => {
+                                Some(ri.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                };
+                let mut tail = Vec::new();
+                // Collect last message from items (if any)
+                for ri in items.iter().rev() {
+                    if let ResponseItem::Message { .. } = ri {
+                        tail.push(ri.clone());
+                        break;
+                    }
+                }
+                // Merge pinned + tail, dedup by text
+                let mut merged: Vec<ResponseItem> = Vec::new();
+                let msg_text_owned = |ri: &ResponseItem| -> Option<String> {
+                    if let ResponseItem::Message { content, .. } = ri {
+                        for c in content {
+                            match c {
+                                crate::ContentItem::OutputText { text } => return Some(text.clone()),
+                                crate::ContentItem::InputText { text } => return Some(text.clone()),
+                                _ => {}
+                            }
+                        }
+                    }
+                    None
+                };
+                for m in pinned_messages.into_iter().chain(tail.into_iter()) {
+                    let mt = msg_text_owned(&m).unwrap_or_default();
+                    let dup = merged
+                        .iter()
+                        .any(|x| msg_text_owned(x).map(|t| t == mt).unwrap_or(false));
+                    if !dup {
+                        merged.push(m);
+                    }
+                }
+
+                let after_estimate = crate::estimate_tokens_for_items(&merged);
+                let report = crate::CompactionReport::new(before_estimate, after_estimate);
+                let message = match model_context_window {
+                    Some(ctx) if ctx > 0 => format!(
+                        "Compaction dry-run: ~{} → ~{} tokens; saved ~{}; remaining ~{}% → ~{}%",
+                        report.before_tokens,
+                        report.after_tokens,
+                        report.before_tokens.saturating_sub(report.after_tokens),
+                        report.percent_remaining_before(ctx),
+                        report.percent_remaining_after(ctx)
+                    ),
+                    _ => format!(
+                        "Compaction dry-run: ~{} → ~{} tokens; saved ~{}",
+                        report.before_tokens,
+                        report.after_tokens,
+                        report.before_tokens.saturating_sub(report.after_tokens)
+                    ),
+                };
+                let _ = sess
+                    .tx_event
+                    .send(Event {
+                        id: sub.id.clone(),
+                        msg: EventMsg::AgentMessage(AgentMessageEvent { message }),
+                    })
+                    .await;
+                let _ = sess
+                    .tx_event
+                    .send(Event {
+                        id: sub.id.clone(),
+                        msg: EventMsg::TaskComplete(TaskCompleteEvent {
+                            last_agent_message: None,
+                        }),
+                    })
+                    .await;
+            }
             Op::Shutdown => {
                 info!("Shutting down Codex instance");
 
@@ -1359,6 +1453,53 @@ async fn submission_loop(
                 if let Err(e) = tx_event.send(event).await {
                     warn!("failed to send ConversationHistory event: {e}");
                 }
+            }
+            Op::PinLast => {
+                // Find the newest message with a provider id still attached and pin it.
+                let pinned_id_opt = {
+                    let st = sess.state.lock_unchecked();
+                    st.history
+                        .contents()
+                        .into_iter()
+                        .rev()
+                        .find_map(|ri| match ri {
+                            ResponseItem::Message { id: Some(id), .. } if !id.is_empty() => {
+                                Some(id)
+                            }
+                            _ => None,
+                        })
+                };
+
+                let msg = match pinned_id_opt {
+                    Some(id) => {
+                        sess.state
+                            .lock_unchecked()
+                            .pinned_message_ids
+                            .insert(id.clone());
+                        format!("Pinned message id: {}", id)
+                    }
+                    None => "No recent message with an id to pin".to_string(),
+                };
+
+                let _ = sess
+                    .tx_event
+                    .send(Event {
+                        id: sub.id.clone(),
+                        msg: EventMsg::AgentMessage(AgentMessageEvent { message: msg }),
+                    })
+                    .await;
+            }
+            Op::UnpinAll => {
+                sess.state.lock_unchecked().pinned_message_ids.clear();
+                let _ = sess
+                    .tx_event
+                    .send(Event {
+                        id: sub.id.clone(),
+                        msg: EventMsg::AgentMessage(AgentMessageEvent {
+                            message: "Cleared all pins".to_string(),
+                        }),
+                    })
+                    .await;
             }
             _ => {
                 // Ignore unknown ops; enum is non_exhaustive to allow extensions.
@@ -1843,6 +1984,18 @@ async fn run_compact_task(
     compact_instructions: String,
 ) {
     let model_context_window = turn_context.client.get_model_context_window();
+    // Capture an estimate of current history token usage (provider-agnostic).
+    let (before_items, before_estimate, pinned_ids): (
+        Vec<ResponseItem>,
+        u64,
+        std::collections::HashSet<String>,
+    ) = {
+        let st = sess.state.lock_unchecked();
+        let items = st.history.contents();
+        let estimate = crate::estimate_tokens_for_items(&items);
+        let pins = st.pinned_message_ids.clone();
+        (items, estimate, pins)
+    };
     let start_event = Event {
         id: sub_id.clone(),
         msg: EventMsg::TaskStarted(TaskStartedEvent {
@@ -1902,14 +2055,81 @@ async fn run_compact_task(
     sess.remove_task(&sub_id);
 
     {
+        // Preserve the last message(s) but also re-insert any pinned messages from the
+        // pre-compaction history so they survive compaction.
+        let pinned_messages: Vec<ResponseItem> = if pinned_ids.is_empty() {
+            Vec::new()
+        } else {
+            before_items
+                .iter()
+                .filter_map(|ri| match ri {
+                    ResponseItem::Message { id: Some(id), .. } if pinned_ids.contains(id) => {
+                        Some(ri.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
         let mut state = sess.state.lock_unchecked();
         state.history.keep_last_messages(1);
+        // Merge pinned + kept tail; avoid duplicate message texts.
+        let mut merged: Vec<ResponseItem> = Vec::new();
+
+        // Helper to get first text content for equality (owned).
+        let msg_text_owned = |ri: &ResponseItem| -> Option<String> {
+            if let ResponseItem::Message { content, .. } = ri {
+                for c in content {
+                    match c {
+                        crate::ContentItem::OutputText { text } => return Some(text.clone()),
+                        crate::ContentItem::InputText { text } => return Some(text.clone()),
+                        _ => {}
+                    }
+                }
+            }
+            None
+        };
+
+        for m in pinned_messages {
+            let mt = msg_text_owned(&m).unwrap_or_default();
+            let dup = merged
+                .iter()
+                .any(|x| msg_text_owned(x).map(|t| t == mt).unwrap_or(false));
+            if !dup {
+                merged.push(m);
+            }
+        }
+        for m in state.history.contents() {
+            let mt = msg_text_owned(&m).unwrap_or_default();
+            let dup = merged
+                .iter()
+                .any(|x| msg_text_owned(x).map(|t| t == mt).unwrap_or(false));
+            if !dup {
+                merged.push(m);
+            }
+        }
+        // Replace history with merged contents by recording items in order.
+        let mut new_hist = ConversationHistory::new();
+        for ri in merged.iter() {
+            new_hist.record_items(std::slice::from_ref(ri));
+        }
+        state.history = new_hist;
     }
 
+    // Compute after-estimate based on updated history.
+    let after_estimate: u64 = {
+        let st = sess.state.lock_unchecked();
+        let items = st.history.contents();
+        drop(st);
+        crate::estimate_tokens_for_items(&items)
+    };
+    let report = crate::CompactionReport::new(before_estimate, after_estimate);
+
+    let completion_message = crate::format_completion_message(&report, model_context_window);
     let event = Event {
         id: sub_id.clone(),
         msg: EventMsg::AgentMessage(AgentMessageEvent {
-            message: "Compact task completed".to_string(),
+            message: completion_message,
         }),
     };
     sess.send_event(event).await;

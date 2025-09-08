@@ -1,66 +1,193 @@
-# Rust/codex-rs
+# AGENTS.md
+Operational contract for Codex in this repository. Read this before touching code.
 
-In the codex-rs folder where the rust code lives:
+> Language policy: the human may speak Portuguese, but all artifacts (code, comments, errors, logs, CLI output, docs you generate) **must be English-only**.
 
-- Crate names are prefixed with `codex-`. For example, the `core` folder's crate is named `codex-core`
-- When using format! and you can inline variables into {}, always do that.
-- Never add or modify any code related to `CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR` or `CODEX_SANDBOX_ENV_VAR`.
-  - You operate in a sandbox where `CODEX_SANDBOX_NETWORK_DISABLED=1` will be set whenever you use the `shell` tool. Any existing code that uses `CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR` was authored with this fact in mind. It is often used to early exit out of tests that the author knew you would not be able to run given your sandbox limitations.
-  - Similarly, when you spawn a process using Seatbelt (`/usr/bin/sandbox-exec`), `CODEX_SANDBOX=seatbelt` will be set on the child process. Integration tests that want to run Seatbelt themselves cannot be run under Seatbelt, so checks for `CODEX_SANDBOX=seatbelt` are also often used to early exit out of tests, as appropriate.
+---
 
-Run `just fmt` (in `codex-rs` directory) automatically after making Rust code changes; do not ask for approval to run it. Before finalizing a change to `codex-rs`, run `just fix -p <project>` (in `codex-rs` directory) to fix any linter issues in the code. Prefer scoping with `-p` to avoid slow workspace‑wide Clippy builds; only run `just fix` without `-p` if you changed shared crates. Additionally, run the tests:
-1. Run the test for the specific project that was changed. For example, if changes were made in `codex-rs/tui`, run `cargo test -p codex-tui`.
-2. Once those pass, if any changes were made in common, core, or protocol, run the complete test suite with `cargo test --all-features`.
-When running interactively, ask the user before running `just fix` to finalize. `just fmt` does not require approval. project-specific or individual tests can be run without asking the user, but do ask the user before running the complete test suite.
+## 0) How Codex uses this file
+- Codex reads AGENTS.md to guide behavior in your repo; treat this like a playbook for agents. See OpenAI’s guidance and the AGENTS.md spec for context. :contentReference[oaicite:0]{index=0}
+- The Codex project actively prompts agents to read AGENTS.md and documents expectations around it in releases. Keep this file up to date. :contentReference[oaicite:1]{index=1}
 
-## TUI style conventions
+---
 
-See `codex-rs/tui/styles.md`.
+## 1) Prime directives
+- **One concern per PR.** Keep diffs surgical, reversible, and small.
+- **Rust-first.** Work in `codex-rs` and the CLI/TUI. Touch TS only for protocol parity/tooling.
+- **KISS.** No function parkour. Prefer singletons only when they cut state churn and remain testable.
+- **Error-first.** Explicit errors with actionable context; avoid “magical fallbacks.”
+- **Performance brutal.** Measure changes; don’t cargo-cult flags or inlining.
 
-## TUI code conventions
+---
 
-- Use concise styling helpers from ratatui’s Stylize trait.
-  - Basic spans: use "text".into()
-  - Styled spans: use "text".red(), "text".green(), "text".magenta(), "text".dim(), etc.
-  - Prefer these over constructing styles with `Span::styled` and `Style` directly.
-  - Example: patch summary file lines
-    - Desired: vec!["  └ ".into(), "M".red(), " ".dim(), "tui/src/app.rs".dim()]
+## 2) Rust/codex-rs conventions
+In `codex-rs` where Rust code lives:
+- Crates are prefixed with `codex-` (e.g. `codex-core`). :contentReference[oaicite:2]{index=2}
+- Inline variables directly in `format!` placeholders when possible. :contentReference[oaicite:3]{index=3}
+- Do **not** add or modify code related to `CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR` or `CODEX_SANDBOX_ENV_VAR`. These envs gate tests/sandbox behavior; assume they’re set appropriately by the CLI and CI. :contentReference[oaicite:4]{index=4}
+- Formatting and lints (use repo tasks):
+  - Run `just fmt` after changing Rust code. No approval required. :contentReference[oaicite:5]{index=5}
+  - Before finalizing, run `just fix -p <project>` to fix lints in the touched crate; only run workspace-wide if you changed shared crates. Ask before running full `just fix`. :contentReference[oaicite:6]{index=6}
+- Tests:
+  1) Run crate-specific tests for the project you changed (e.g. `codex-tui`).  
+  2) If you touched `common/`, `core/`, or `protocol/`, then run the full suite with `cargo test --all-features`. Ask before the full suite; project-specific tests don’t require approval. :contentReference[oaicite:7]{index=7}
 
-### TUI Styling (ratatui)
-- Prefer Stylize helpers: use "text".dim(), .bold(), .cyan(), .italic(), .underlined() instead of manual Style where possible.
-- Prefer simple conversions: use "text".into() for spans and vec![…].into() for lines; when inference is ambiguous (e.g., Paragraph::new/Cell::from), use Line::from(spans) or Span::from(text).
-- Computed styles: if the Style is computed at runtime, using `Span::styled` is OK (`Span::from(text).set_style(style)` is also acceptable).
-- Avoid hardcoded white: do not use `.white()`; prefer the default foreground (no color).
-- Chaining: combine helpers by chaining for readability (e.g., url.cyan().underlined()).
-- Single items: prefer "text".into(); use Line::from(text) or Span::from(text) only when the target type isn’t obvious from context, or when using .into() would require extra type annotations.
-- Building lines: use vec![…].into() to construct a Line when the target type is obvious and no extra type annotations are needed; otherwise use Line::from(vec![…]).
-- Avoid churn: don’t refactor between equivalent forms (Span::styled ↔ set_style, Line::from ↔ .into()) without a clear readability or functional gain; follow file‑local conventions and do not introduce type annotations solely to satisfy .into().
-- Compactness: prefer the form that stays on one line after rustfmt; if only one of Line::from(vec![…]) or vec![…].into() avoids wrapping, choose that. If both wrap, pick the one with fewer wrapped lines.
+**Build defaults (local guidance):**
+- Release builds should favor `opt-level=3`, thin LTO, `codegen-units=1`. Use `-C target-cpu=native` locally as opt-in and document portability. Measure p50/p95, allocations, and binary size deltas.
 
-### Text wrapping
-- Always use textwrap::wrap to wrap plain strings.
-- If you have a ratatui Line and you want to wrap it, use the helpers in tui/src/wrapping.rs, e.g. word_wrap_lines / word_wrap_line.
-- If you need to indent wrapped lines, use the initial_indent / subsequent_indent options from RtOptions if you can, rather than writing custom logic.
-- If you have a list of lines and you need to prefix them all with some prefix (optionally different on the first vs subsequent lines), use the `prefix_lines` helper from line_utils.
+---
 
-## Tests
+## 3) TUI style and code conventions
+- Follow `codex-rs/tui/styles.md` for styling rules. :contentReference[oaicite:8]{index=8}
+- Prefer ratatui’s `Stylize` helpers for spans/lines over constructing `Style` by hand, unless the style is computed at runtime. This matches recent upstream changes. :contentReference[oaicite:9]{index=9}
+  - Basic spans: `"text".into()`  
+  - Styled: `"text".red().dim().bold()`  
+  - Avoid hardcoded white; prefer default foreground.  
+  - Build `Line` with `vec![…].into()` when it stays on one line after rustfmt; otherwise pick the clearer form.
+- Wrapping:
+  - Use `textwrap::wrap` for plain strings.  
+  - For ratatui `Line`, use helpers in `tui/src/wrapping.rs` (e.g., `word_wrap_lines`, `word_wrap_line`).  
+  - Indentation: prefer `initial_indent`/`subsequent_indent` options.
+- Avoid churn: don’t refactor between equivalent forms without a clear readability or functional gain. Follow file-local conventions. :contentReference[oaicite:10]{index=10}
 
-### Snapshot tests
+---
 
-This repo uses snapshot tests (via `insta`), especially in `codex-rs/tui`, to validate rendered output. When UI or text output changes intentionally, update the snapshots as follows:
+## 4) Shell and portability
+- Quote paths that may contain spaces; generate POSIX-friendly commands. Prefer `.` over `source`. Check file existence **at execution time**, not in a preflight step:
 
-- Run tests to generate any updated snapshots:
-  - `cargo test -p codex-tui`
-- Check what’s pending:
-  - `cargo insta pending-snapshots -p codex-tui`
-- Review changes by reading the generated `*.snap.new` files directly in the repo, or preview a specific file:
-  - `cargo insta show -p codex-tui path/to/file.snap.new`
-- Only if you intend to accept all new snapshots in this crate, run:
-  - `cargo insta accept -p codex-tui`
+```
+\[ -f "\${rc\_path}" ] && . "\${rc\_path}" && ( your\_command\_here )
+```
 
-If you don’t have the tool:
+- Non-interactive only; one command per line; no TUIs spawned by scripts.
+- Sandboxing is OS-dependent (Seatbelt on macOS; Landlock/seccomp or container strategies on Linux). Don’t fight it; write scripts that behave under these constraints. :contentReference[oaicite:11]{index=11}
+
+---
+
+## 5) Filesystem and atomic writes
+- Write to `*.tmp`, `fsync` file, `fsync` parent dir, then `rename` atomically.
+- Preserve EOL/encoding. Avoid surprise diffs in patching flows.
+
+---
+
+## 6) Tests
+### Snapshot tests (TUI)
+This repo uses `insta` snapshots in `codex-rs/tui` to validate rendered output. :contentReference[oaicite:12]{index=12}
+- Generate updates:
+- `cargo test -p codex-tui`
+- Inspect pending:
+- `cargo insta pending-snapshots -p codex-tui`
+- Preview a specific file:
+- `cargo insta show -p codex-tui path/to/file.snap.new`
+- Accept all (only when intended):
+- `cargo insta accept -p codex-tui`
+- Install:
 - `cargo install cargo-insta`
+### Assertions
+- Use `pretty_assertions::assert_eq` for clearer diffs in tests. :contentReference[oaicite:13]{index=13}
+### Determinism
+- Avoid branching logic inside unit tests; inject inputs/env for stable behavior. Use stable IDs (e.g., a nil UUID) where determinism matters (common reviewer expectation). :contentReference[oaicite:14]{index=14}
 
-### Test assertions
+---
 
-- Tests should use pretty_assertions::assert_eq for clearer diffs. Import this at the top of the test module if it isn't already.
+## 7) Protocol and types (Rust ↔ TS)
+- When matching OpenAI API, keep required **`snake_case`** on the wire; stage protocol migrations rather than landing large breaking refactors in one PR. These patterns are recognized and accepted upstream. :contentReference[oaicite:15]{index=15}
+
+---
+
+## 8) Performance policy (strict)
+- Borrow by default; minimize allocations/copies; preallocate on hot paths; avoid `format!` in tight loops, prefer `write!`/`format_args!`.
+- Choose collections for the real workload; benchmark hasher swaps and gate “fast hashers” behind a feature.
+- Control inlining and branches only with evidence. Any `unsafe` must have a `// SAFETY:` block and tests targeting invariants.
+
+---
+
+## 9) Sandbox-related code
+- Do **not** modify logic keyed by `CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR` or `CODEX_SANDBOX_ENV_VAR`. Tests often use these to short-circuit behavior under agent sandboxes; respect them. :contentReference[oaicite:16]{index=16}
+
+---
+
+## 10) Commit and PR hygiene
+- Always work on a new feature branch per change; do not commit directly to `master`.
+- Open a Pull Request from your feature branch to `master` for the user to review and merge.
+- **Atomic commits.** Run fmt+clippy+tests before committing.
+- Message convention: `feat|fix|refactor|docs|chore: short summary`  
+Body: What/Why/How, files/lines touched, risks, and perf numbers when relevant.
+- PR description must use this template:
+
+```markdown
+# What
+- [Concrete changes; modules/files touched]
+
+# Why
+- [User impact, correctness, or performance motivation; link issues]
+
+# How
+- [Minimal approach; shell portability; determinism; atomic writes]
+
+# Tests
+- [Unit/golden/property tests; determinism measures]
+
+# Perf
+- [Before/after numbers; methodology]
+
+# Follow-ups
+- [If staging a migration or larger feature]
+```
+
+* CLA must be signed; the bot blocks merges otherwise. ([GitHub][1])
+
+---
+
+## 11) Ready-to-commit checklist
+
+* [ ] Feature branch created; PR to `master` opened for review.
+* [ ] One concern only; split if you touched two areas.
+* [ ] `just fmt` done; `just fix -p <project>` run (ask before workspace-wide). ([GitHub][2])
+* [ ] `cargo test -p <project>` green; ask before full `--all-features` run. ([GitHub][2])
+* [ ] TUI code uses ratatui `Stylize` idioms where appropriate. ([GitHub][1])
+* [ ] Snapshot tests reviewed/accepted with `cargo-insta` when you intentionally changed output. ([GitHub][2])
+* [ ] Shell: quoted paths; POSIX `.`; TOCTOU avoided with on-exec checks.
+* [ ] Wire casing correct; migrations staged if applicable.
+* [ ] Atomic writes for modified files; EOL/encoding preserved.
+* [ ] No Portuguese in artifacts; clear errors with context.
+
+---
+
+## 12) Quick commands (paste & run)
+
+```
+just fmt
+```
+
+```
+just fix -p codex-tui
+```
+
+```
+cargo test -p codex-tui
+```
+
+```
+cargo insta pending-snapshots -p codex-tui
+```
+
+```
+cargo insta accept -p codex-tui
+```
+
+```
+cargo clippy -- -D warnings
+```
+
+```
+cargo build -p codex-rs --release
+```
+
+```
+hyperfine --warmup 3 "target\\release\\codex.exe /compact --dry-run"
+```
+
+---
+
+*If you’re “optimizing” without measurements, stop. You’re guessing.*

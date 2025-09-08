@@ -830,6 +830,17 @@ impl ChatWidget {
                 self.clear_token_usage();
                 self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
             }
+            SlashCommand::CompactDryRun => {
+                self.clear_token_usage();
+                self.app_event_tx
+                    .send(AppEvent::CodexOp(Op::CompactDryRun));
+            }
+            SlashCommand::Pin => {
+                self.app_event_tx.send(AppEvent::CodexOp(Op::PinLast));
+            }
+            SlashCommand::Unpin => {
+                self.app_event_tx.send(AppEvent::CodexOp(Op::UnpinAll));
+            }
             SlashCommand::Model => {
                 self.open_model_popup();
             }

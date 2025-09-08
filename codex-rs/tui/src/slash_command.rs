@@ -17,6 +17,10 @@ pub enum SlashCommand {
     New,
     Init,
     Compact,
+    #[strum(serialize = "compact-dry-run")]
+    CompactDryRun,
+    Pin,
+    Unpin,
     Diff,
     Mention,
     Status,
@@ -34,6 +38,9 @@ impl SlashCommand {
             SlashCommand::New => "start a new chat during a conversation",
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
+            SlashCommand::CompactDryRun => "preview compaction delta (no changes)",
+            SlashCommand::Pin => "pin the most recent message (preserve across /compact)",
+            SlashCommand::Unpin => "clear all pinned messages",
             SlashCommand::Quit => "exit Codex",
             SlashCommand::Diff => "show git diff (including untracked files)",
             SlashCommand::Mention => "mention a file",
@@ -59,6 +66,9 @@ impl SlashCommand {
             SlashCommand::New
             | SlashCommand::Init
             | SlashCommand::Compact
+            | SlashCommand::CompactDryRun
+            | SlashCommand::Pin
+            | SlashCommand::Unpin
             | SlashCommand::Model
             | SlashCommand::Approvals
             | SlashCommand::Logout => false,
