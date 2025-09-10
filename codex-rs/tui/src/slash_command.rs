@@ -19,6 +19,17 @@ pub enum SlashCommand {
     Compact,
     #[strum(serialize = "compact-dry-run")]
     CompactDryRun,
+    #[strum(serialize = "soft-compact")]
+    #[strum(serialize = "softcompact")]
+    SoftCompact,
+    #[strum(serialize = "test-mode")]
+    TestMode,
+    #[strum(serialize = "list-rids")]
+    ListRids,
+    #[strum(serialize = "branch-last")]
+    BranchLast,
+    #[strum(serialize = "branch")]
+    Branch,
     Pin,
     Unpin,
     Diff,
@@ -39,6 +50,11 @@ impl SlashCommand {
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
             SlashCommand::CompactDryRun => "preview compaction delta (no changes)",
+            SlashCommand::SoftCompact => "summarize without pruning; also rotate/truncate logs",
+            SlashCommand::TestMode => "toggle server-context test mode (on/off)",
+            SlashCommand::ListRids => "list provider response ids seen in this session",
+            SlashCommand::BranchLast => "resume next turn from the last response id",
+            SlashCommand::Branch => "resume next turn from a specific response id: /branch <id>",
             SlashCommand::Pin => "pin the most recent message (preserve across /compact)",
             SlashCommand::Unpin => "clear all pinned messages",
             SlashCommand::Quit => "exit Codex",
@@ -67,6 +83,11 @@ impl SlashCommand {
             | SlashCommand::Init
             | SlashCommand::Compact
             | SlashCommand::CompactDryRun
+            | SlashCommand::SoftCompact
+            | SlashCommand::TestMode
+            | SlashCommand::ListRids
+            | SlashCommand::BranchLast
+            | SlashCommand::Branch
             | SlashCommand::Pin
             | SlashCommand::Unpin
             | SlashCommand::Model

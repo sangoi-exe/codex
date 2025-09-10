@@ -46,7 +46,20 @@ struct SessionMetaWithGit {
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
-pub struct SessionStateSnapshot {}
+pub struct SessionStateSnapshot {
+    /// Optional provider response id marker for test-mode lightweight logs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rid: Option<String>,
+    /// Optional free-form note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Optional micro-summary (first sentence/words) to identify message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Optional message kind (e.g., "user", "assistant").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct SavedSession {
@@ -75,7 +88,13 @@ pub struct RolloutRecorder {
 enum RolloutCmd {
     AddItems(Vec<ResponseItem>),
     UpdateState(SessionStateSnapshot),
-    Shutdown { ack: oneshot::Sender<()> },
+    /// Switch to a fresh rollout file (e.g., after compact/softcompact)
+    Rotate {
+        reason: String,
+    },
+    Shutdown {
+        ack: oneshot::Sender<()>,
+    },
 }
 
 impl RolloutRecorder {
@@ -131,6 +150,7 @@ impl RolloutRecorder {
                 instructions,
             }),
             cwd,
+            config.codex_home.clone(),
         ));
 
         Ok(Self { tx })
@@ -220,6 +240,17 @@ impl RolloutRecorder {
             }
         }
     }
+
+    /// Ask the recorder task to rotate to a new rollout file. This helps
+    /// bound log growth for long-running conversations.
+    pub async fn rotate(&self, reason: &str) -> std::io::Result<()> {
+        self.tx
+            .send(RolloutCmd::Rotate {
+                reason: reason.to_string(),
+            })
+            .await
+            .map_err(|e| IoError::other(format!("failed to queue rollout rotate: {e}")))
+    }
 }
 
 struct LogFileInfo {
@@ -272,12 +303,16 @@ async fn rollout_writer(
     mut rx: mpsc::Receiver<RolloutCmd>,
     mut meta: Option<SessionMeta>,
     cwd: std::path::PathBuf,
+    codex_home: std::path::PathBuf,
 ) -> std::io::Result<()> {
     let mut writer = JsonlWriter { file };
+    let mut last_instructions: Option<String> = None;
+    let session_id_for_rotation = meta.as_ref().map(|m| m.id);
 
     // If we have a meta, collect git info asynchronously and write meta first
     if let Some(session_meta) = meta.take() {
         let git_info = collect_git_info(&cwd).await;
+        last_instructions = session_meta.instructions.clone();
         let session_meta_with_git = SessionMetaWithGit {
             meta: session_meta,
             git: git_info,
@@ -311,6 +346,45 @@ async fn rollout_writer(
                     })
                     .await?;
             }
+            RolloutCmd::Rotate { reason } => {
+                // Create a new rollout file under the same codex_home using the
+                // same session id so tools can correlate the lineage.
+                let sid = session_id_for_rotation.unwrap_or_else(|| Uuid::new_v4());
+                let (new_file, ts) = create_log_file_for_home(&codex_home, sid)?;
+                writer.file = tokio::fs::File::from_std(new_file);
+
+                // Write a fresh SessionMeta + git info header.
+                let git_info = collect_git_info(&cwd).await;
+                let timestamp_format: &[FormatItem] = format_description!(
+                    "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+                );
+                let ts_utc = ts
+                    .to_offset(time::UtcOffset::UTC)
+                    .format(timestamp_format)
+                    .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
+                let header = SessionMetaWithGit {
+                    meta: SessionMeta {
+                        id: sid,
+                        timestamp: ts_utc,
+                        instructions: last_instructions.clone(),
+                    },
+                    git: git_info,
+                };
+                writer.write_line(&header).await?;
+
+                // Also write a rotation marker for clarity.
+                #[derive(Serialize)]
+                struct Rotation<'a> {
+                    record_type: &'static str,
+                    reason: &'a str,
+                }
+                writer
+                    .write_line(&Rotation {
+                        record_type: "rollover",
+                        reason: &reason,
+                    })
+                    .await?;
+            }
             RolloutCmd::Shutdown { ack } => {
                 let _ = ack.send(());
             }
@@ -318,6 +392,34 @@ async fn rollout_writer(
     }
 
     Ok(())
+}
+
+/// Create a rollout log file under `<codex_home>/sessions/YYYY/MM/DD`.
+fn create_log_file_for_home(
+    codex_home: &Path,
+    session_id: Uuid,
+) -> std::io::Result<(File, OffsetDateTime)> {
+    let timestamp = OffsetDateTime::now_local()
+        .map_err(|e| IoError::other(format!("failed to get local time: {e}")))?;
+    let mut dir = codex_home.to_path_buf();
+    dir.push(SESSIONS_SUBDIR);
+    dir.push(timestamp.year().to_string());
+    dir.push(format!("{:02}", u8::from(timestamp.month())));
+    dir.push(format!("{:02}", timestamp.day()));
+    fs::create_dir_all(&dir)?;
+
+    let format: &[FormatItem] =
+        format_description!("[year]-[month]-[day]T[hour]-[minute]-[second]");
+    let date_str = timestamp
+        .format(format)
+        .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
+    let filename = format!("rollout-{date_str}-{session_id}.jsonl");
+    let path = dir.join(filename);
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)?;
+    Ok((file, timestamp))
 }
 
 struct JsonlWriter {

@@ -87,5 +87,6 @@ pub use codex_protocol::models::LocalShellExecAction;
 pub use codex_protocol::models::LocalShellStatus;
 pub use codex_protocol::models::ReasoningItemContent;
 pub use codex_protocol::models::ResponseItem;
+pub(crate) use compact::CompactionReport;
+pub(crate) use compact::estimate_tokens_for_items;
 pub(crate) use compact::format_completion_message;
-pub(crate) use compact::{CompactionReport, estimate_tokens_for_items};

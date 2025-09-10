@@ -76,6 +76,22 @@ pub struct ModelClient {
 }
 
 impl ModelClient {
+    /// Create a shallow clone of this client but with a different session id.
+    ///
+    /// This is useful for one-off requests (e.g., soft-compaction or
+    /// log-cleanup turns) where we intentionally do not want to associate the
+    /// request with the ongoing conversation/cache key.
+    pub fn clone_with_session_id(&self, session_id: Uuid) -> Self {
+        Self {
+            config: self.config.clone(),
+            auth_manager: self.auth_manager.clone(),
+            client: self.client.clone(),
+            provider: self.provider.clone(),
+            session_id,
+            effort: self.effort,
+            summary: self.summary,
+        }
+    }
     pub fn new(
         config: Arc<Config>,
         auth_manager: Option<Arc<AuthManager>>,
@@ -194,11 +210,12 @@ impl ModelClient {
             tool_choice: "auto",
             parallel_tool_calls: false,
             reasoning,
-            store: false,
+            store: prompt.store_override.unwrap_or(false),
             stream: true,
             include,
             prompt_cache_key: Some(self.session_id.to_string()),
             text,
+            previous_response_id: prompt.previous_response_id.clone(),
         };
 
         let mut attempt = 0;

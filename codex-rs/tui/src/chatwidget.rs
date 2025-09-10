@@ -827,13 +827,54 @@ impl ChatWidget {
                 self.submit_text_message(INIT_PROMPT.to_string());
             }
             SlashCommand::Compact => {
+                self.maybe_compact_tui_logs();
                 self.clear_token_usage();
                 self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
             }
             SlashCommand::CompactDryRun => {
                 self.clear_token_usage();
+                self.app_event_tx.send(AppEvent::CodexOp(Op::CompactDryRun));
+            }
+            SlashCommand::SoftCompact => {
+                self.maybe_compact_tui_logs();
+                self.clear_token_usage();
+                self.app_event_tx.send(AppEvent::CodexOp(Op::SoftCompact));
+            }
+            SlashCommand::TestMode => {
                 self.app_event_tx
-                    .send(AppEvent::CodexOp(Op::CompactDryRun));
+                    .send(AppEvent::CodexOp(Op::SetTestMode { enable: true }));
+            }
+            SlashCommand::ListRids => {
+                self.app_event_tx
+                    .send(AppEvent::CodexOp(Op::ListResponseIds));
+            }
+            SlashCommand::BranchLast => {
+                self.app_event_tx
+                    .send(AppEvent::CodexOp(Op::SetBranchFromLast));
+            }
+            SlashCommand::Branch => {
+                // Extract argument from the last command line captured by the composer.
+                let raw = self
+                    .bottom_pane
+                    .take_last_command_line()
+                    .unwrap_or_default();
+                let id = raw
+                    .strip_prefix('/')
+                    .unwrap_or(&raw)
+                    .trim_start()
+                    .strip_prefix("branch")
+                    .unwrap_or("")
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if id.is_empty() {
+                    self.on_agent_message("Usage: /branch <response_id>".to_string());
+                } else {
+                    self.app_event_tx
+                        .send(AppEvent::CodexOp(Op::SetBranchFromId { id }));
+                }
             }
             SlashCommand::Pin => {
                 self.app_event_tx.send(AppEvent::CodexOp(Op::PinLast));
@@ -919,6 +960,59 @@ impl ChatWidget {
                         grant_root: Some(PathBuf::from("/tmp")),
                     }),
                 }));
+            }
+        }
+    }
+
+    /// Truncate overly large local logs to keep the TUI responsive and prevent
+    /// disk bloat. Targets `codex-tui.log` and, when enabled, the most recent
+    /// `session-*.jsonl` under the log directory.
+    fn maybe_compact_tui_logs(&self) {
+        use std::fs::{self, OpenOptions};
+        use std::io::Write;
+
+        const MAX_TUI_LOG_BYTES: u64 = 20 * 1024 * 1024; // 20 MiB
+        const MAX_SESSION_LOG_BYTES: u64 = 20 * 1024 * 1024; // 20 MiB
+
+        let log_dir = match codex_core::config::log_dir(&self.config) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        // Truncate codex-tui.log if too large.
+        let tui_log = log_dir.join("codex-tui.log");
+        if let Ok(meta) = fs::metadata(&tui_log) {
+            if meta.len() > MAX_TUI_LOG_BYTES {
+                if let Ok(mut f) = OpenOptions::new().write(true).truncate(true).open(&tui_log) {
+                    let _ = f.write_all(b"[codex-tui] log truncated due to size threshold\n");
+                }
+            }
+        }
+
+        // Truncate the most recent session-*.jsonl if session logging is enabled.
+        let session_enabled = std::env::var("CODEX_TUI_RECORD_SESSION")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
+        if session_enabled {
+            if let Ok(read) = fs::read_dir(&log_dir) {
+                for entry in read.flatten() {
+                    let path = entry.path();
+                    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                        if name.starts_with("session-") && name.ends_with(".jsonl") {
+                            if let Ok(meta) = entry.metadata() {
+                                if meta.len() > MAX_SESSION_LOG_BYTES {
+                                    if let Ok(mut f) =
+                                        OpenOptions::new().write(true).truncate(true).open(&path)
+                                    {
+                                        let _ = f.write_all(
+                                            b"[session-log] log truncated due to size threshold\n",
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1054,6 +1148,24 @@ impl ChatWidget {
             EventMsg::TaskStarted(_) => self.on_task_started(),
             EventMsg::TaskComplete(TaskCompleteEvent { .. }) => self.on_task_complete(),
             EventMsg::TokenCount(ev) => self.set_token_info(ev.info),
+            EventMsg::ResponseIds(ev) => {
+                let text = if ev.entries.is_empty() {
+                    "No response ids recorded yet".to_string()
+                } else {
+                    let mut s = String::from("Response IDs (newest last):\n");
+                    for e in ev.entries {
+                        s.push_str(" • ");
+                        s.push_str(&e.id);
+                        if let Some(summary) = e.summary {
+                            s.push_str(" — ");
+                            s.push_str(&summary);
+                        }
+                        s.push('\n');
+                    }
+                    s
+                };
+                self.on_agent_message(text);
+            }
             EventMsg::Error(ErrorEvent { message }) => self.on_error(message),
             EventMsg::TurnAborted(ev) => match ev.reason {
                 TurnAbortReason::Interrupted => {

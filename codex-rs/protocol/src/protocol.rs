@@ -166,6 +166,26 @@ pub enum Op {
     /// token delta and suggested percent remaining.
     CompactDryRun,
 
+    /// Generate a summary of the current conversation context without
+    /// pruning or altering the in-memory history. Intended to reduce log
+    /// growth and produce a snapshot while keeping the full transcript.
+    /// Also a good opportunity to rotate/truncate logs.
+    SoftCompact,
+
+    /// Enable/disable test mode. In test mode, Codex prefers server-side
+    /// context via response ids and minimizes local persistence.
+    SetTestMode { enable: bool },
+
+    /// Set branch point to the most recent provider response id so the next
+    /// turn resumes from server-side context.
+    SetBranchFromLast,
+    /// Set branch point to a specific provider response id. The next turn
+    /// will resume from this id on the server side.
+    SetBranchFromId { id: String },
+
+    /// List provider response ids observed in this session so far.
+    ListResponseIds,
+
     /// Pin the most recent assistant/user message that still carries a provider id.
     /// Useful for retention during subsequent compaction steps.
     PinLast,
@@ -510,6 +530,7 @@ pub enum EventMsg {
     ShutdownComplete,
 
     ConversationHistory(ConversationHistoryResponseEvent),
+    ResponseIds(ResponseIdsEvent),
 }
 
 // Individual event payload types matching each `EventMsg` variant.
@@ -804,6 +825,24 @@ pub struct WebSearchEndEvent {
 pub struct ConversationHistoryResponseEvent {
     pub conversation_id: Uuid,
     pub entries: Vec<ResponseItem>,
+}
+
+/// A single response id accompanied by optional metadata useful for selective
+/// resume/branching.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ResponseIdEntry {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+/// Response payload containing provider response ids observed during this
+/// session, newest last.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ResponseIdsEvent {
+    pub entries: Vec<ResponseIdEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

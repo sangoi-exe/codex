@@ -114,6 +114,7 @@ use crate::util::backoff;
 use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::custom_prompts::CustomPrompt;
+use codex_protocol::models::ContentItem as ModelContentItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::LocalShellAction;
@@ -265,6 +266,15 @@ struct State {
     token_info: Option<TokenUsageInfo>,
     /// Provider message ids that are pinned and should be preserved by compaction.
     pinned_message_ids: std::collections::HashSet<String>,
+    /// Provider response ids observed for this session, newest last.
+    response_ids: Vec<String>,
+    /// Micro-summaries for provider response ids.
+    response_summaries: std::collections::HashMap<String, String>,
+    /// When `true`, prefer server-side context and minimize local persistence.
+    test_mode: bool,
+    /// If set, use this response id as `previous_response_id` for the next turn
+    /// and then clear it.
+    next_previous_response_id: Option<String>,
 }
 
 /// Context for an initialized model agent
@@ -312,6 +322,29 @@ impl TurnContext {
         path.as_ref()
             .map(PathBuf::from)
             .map_or_else(|| self.cwd.clone(), |p| self.cwd.join(p))
+    }
+}
+
+fn micro_summary_from_content(content: Vec<ModelContentItem>) -> String {
+    // Extract first text content; compress whitespace; clip to ~80 chars.
+    let mut text = String::new();
+    for c in content.iter() {
+        match c {
+            ModelContentItem::OutputText { text: t } | ModelContentItem::InputText { text: t } => {
+                text = t.clone();
+                break;
+            }
+            _ => {}
+        }
+    }
+    let s = text.replace('\n', " ").trim().to_string();
+    let max = 80usize;
+    if s.len() > max {
+        let mut clipped = s.chars().take(max).collect::<String>();
+        clipped.push('…');
+        clipped
+    } else {
+        s
     }
 }
 
@@ -668,7 +701,14 @@ impl Session {
     }
 
     async fn record_state_snapshot(&self, items: &[ResponseItem]) {
-        let snapshot = { crate::rollout::SessionStateSnapshot {} };
+        let snapshot = crate::rollout::SessionStateSnapshot {
+            rid: None,
+            note: None,
+            summary: None,
+            kind: None,
+        };
+
+        let test_mode_enabled = { self.state.lock_unchecked().test_mode };
 
         let recorder = {
             let guard = self.rollout.lock_unchecked();
@@ -679,8 +719,10 @@ impl Session {
             if let Err(e) = rec.record_state(snapshot).await {
                 error!("failed to record rollout state: {e:#}");
             }
-            if let Err(e) = rec.record_items(items).await {
-                error!("failed to record rollout items: {e:#}");
+            if !test_mode_enabled {
+                if let Err(e) = rec.record_items(items).await {
+                    error!("failed to record rollout items: {e:#}");
+                }
             }
         }
     }
@@ -1356,8 +1398,12 @@ async fn submission_loop(
                     if let ResponseItem::Message { content, .. } = ri {
                         for c in content {
                             match c {
-                                crate::ContentItem::OutputText { text } => return Some(text.clone()),
-                                crate::ContentItem::InputText { text } => return Some(text.clone()),
+                                crate::ContentItem::OutputText { text } => {
+                                    return Some(text.clone());
+                                }
+                                crate::ContentItem::InputText { text } => {
+                                    return Some(text.clone());
+                                }
                                 _ => {}
                             }
                         }
@@ -1406,6 +1452,222 @@ async fn submission_loop(
                         msg: EventMsg::TaskComplete(TaskCompleteEvent {
                             last_agent_message: None,
                         }),
+                    })
+                    .await;
+            }
+            Op::SoftCompact => {
+                // Option B: run summarization but do not prune history.
+                // Also perform a rollout log rotation to keep file sizes in check.
+                let model_context_window = turn_context.client.get_model_context_window();
+
+                // Snapshot current before-estimate.
+                let before_estimate = {
+                    let st = sess.state.lock_unchecked();
+                    let items = st.history.contents();
+                    crate::estimate_tokens_for_items(&items)
+                };
+
+                // Build a temporary turn context whose client uses a fresh
+                // session id so this one-off call does not tie to the
+                // provider's cached conversation.
+                let temp_client = turn_context
+                    .client
+                    .clone_with_session_id(uuid::Uuid::new_v4());
+                let mut temp_turn_context = TurnContext {
+                    client: temp_client,
+                    tools_config: turn_context.tools_config.clone(),
+                    user_instructions: turn_context.user_instructions.clone(),
+                    base_instructions: turn_context.base_instructions.clone(),
+                    approval_policy: turn_context.approval_policy,
+                    sandbox_policy: turn_context.sandbox_policy.clone(),
+                    shell_environment_policy: turn_context.shell_environment_policy.clone(),
+                    cwd: turn_context.cwd.clone(),
+                };
+
+                // Fire TaskStarted with model context window.
+                let start_event = Event {
+                    id: sub.id.clone(),
+                    msg: EventMsg::TaskStarted(TaskStartedEvent {
+                        model_context_window,
+                    }),
+                };
+                if sess.tx_event.send(start_event).await.is_err() {
+                    continue;
+                }
+
+                // Create a summarization request as user input
+                const SUMMARIZATION_PROMPT: &str = include_str!("prompt_for_compact_command.md");
+
+                let initial_input_for_turn: ResponseInputItem =
+                    ResponseInputItem::from(vec![InputItem::Text {
+                        text: "Start Summarization".to_string(),
+                    }]);
+
+                let turn_input: Vec<ResponseItem> =
+                    sess.turn_input_with_history(vec![initial_input_for_turn.clone().into()]);
+                let prompt = Prompt {
+                    input: turn_input,
+                    tools: Vec::new(),
+                    base_instructions_override: Some(SUMMARIZATION_PROMPT.to_string()),
+                    store_override: None,
+                    previous_response_id: None,
+                };
+
+                // Drain stream to completion using the temporary context.
+                if let Err(e) =
+                    drain_to_completed(&sess, &temp_turn_context, &sub.id, &prompt).await
+                {
+                    let event = Event {
+                        id: sub.id.clone(),
+                        msg: EventMsg::Error(ErrorEvent {
+                            message: e.to_string(),
+                        }),
+                    };
+                    let _ = sess.tx_event.send(event).await;
+                    let _ = sess
+                        .tx_event
+                        .send(Event {
+                            id: sub.id.clone(),
+                            msg: EventMsg::TaskComplete(TaskCompleteEvent {
+                                last_agent_message: None,
+                            }),
+                        })
+                        .await;
+                    continue;
+                }
+
+                // Compute after-estimate based on updated in-memory history
+                // (the model's assistant summary is now recorded).
+                let after_estimate = {
+                    let st = sess.state.lock_unchecked();
+                    let items = st.history.contents();
+                    crate::estimate_tokens_for_items(&items)
+                };
+                let report = crate::CompactionReport::new(before_estimate, after_estimate);
+
+                let message = match model_context_window {
+                    Some(ctx) if ctx > 0 => format!(
+                        "Soft compaction: ~{} → ~{} tokens; delta ~{}; remaining ~{}% → ~{}% (no history pruned)",
+                        report.before_tokens,
+                        report.after_tokens,
+                        report.after_tokens.saturating_sub(report.before_tokens),
+                        report.percent_remaining_before(ctx),
+                        report.percent_remaining_after(ctx)
+                    ),
+                    _ => format!(
+                        "Soft compaction: ~{} → ~{} tokens; delta ~{} (no history pruned)",
+                        report.before_tokens,
+                        report.after_tokens,
+                        report.after_tokens.saturating_sub(report.before_tokens)
+                    ),
+                };
+                let _ = sess
+                    .tx_event
+                    .send(Event {
+                        id: sub.id.clone(),
+                        msg: EventMsg::AgentMessage(AgentMessageEvent { message }),
+                    })
+                    .await;
+
+                // Rotate rollout file to mitigate log growth.
+                let rec_opt = { sess.rollout.lock_unchecked().clone() };
+                if let Some(rec) = rec_opt {
+                    let _ = rec.rotate("softcompact").await;
+                }
+
+                let _ = sess
+                    .tx_event
+                    .send(Event {
+                        id: sub.id.clone(),
+                        msg: EventMsg::TaskComplete(TaskCompleteEvent {
+                            last_agent_message: None,
+                        }),
+                    })
+                    .await;
+            }
+            Op::SetTestMode { enable } => {
+                sess.state.lock_unchecked().test_mode = enable;
+                let msg = if enable {
+                    "Test mode enabled (server-side context preferred)"
+                } else {
+                    "Test mode disabled"
+                };
+                let _ = sess
+                    .tx_event
+                    .send(Event {
+                        id: sub.id.clone(),
+                        msg: EventMsg::AgentMessage(AgentMessageEvent {
+                            message: msg.to_string(),
+                        }),
+                    })
+                    .await;
+            }
+            Op::SetBranchFromLast => {
+                let last = sess.state.lock_unchecked().response_ids.last().cloned();
+                match last {
+                    Some(rid) => {
+                        sess.state.lock_unchecked().next_previous_response_id = Some(rid.clone());
+                        let _ = sess
+                            .tx_event
+                            .send(Event {
+                                id: sub.id.clone(),
+                                msg: EventMsg::AgentMessage(AgentMessageEvent {
+                                    message: format!(
+                                        "Branch point set to last response id: {}",
+                                        rid
+                                    ),
+                                }),
+                            })
+                            .await;
+                    }
+                    None => {
+                        let _ = sess
+                            .tx_event
+                            .send(Event {
+                                id: sub.id.clone(),
+                                msg: EventMsg::AgentMessage(AgentMessageEvent {
+                                    message: "No response id available to branch from".to_string(),
+                                }),
+                            })
+                            .await;
+                    }
+                }
+            }
+            Op::SetBranchFromId { id } => {
+                // Accept the id as-is; optionally verify it exists in our seen list.
+                let known = sess.state.lock_unchecked().response_ids.contains(&id);
+                sess.state.lock_unchecked().next_previous_response_id = Some(id.clone());
+                let msg = if known {
+                    format!("Branch point set to response id: {}", id)
+                } else {
+                    format!("Branch point set to response id (not seen locally): {}", id)
+                };
+                let _ = sess
+                    .tx_event
+                    .send(Event {
+                        id: sub.id.clone(),
+                        msg: EventMsg::AgentMessage(AgentMessageEvent { message: msg }),
+                    })
+                    .await;
+            }
+            Op::ListResponseIds => {
+                let (ids, summaries) = {
+                    let st = sess.state.lock_unchecked();
+                    (st.response_ids.clone(), st.response_summaries.clone())
+                };
+                let entries = ids
+                    .into_iter()
+                    .map(|id| crate::protocol::ResponseIdEntry {
+                        id: id.clone(),
+                        summary: summaries.get(&id).cloned(),
+                        kind: Some("assistant".to_string()),
+                    })
+                    .collect();
+                let _ = sess
+                    .tx_event
+                    .send(Event {
+                        id: sub.id.clone(),
+                        msg: EventMsg::ResponseIds(crate::protocol::ResponseIdsEvent { entries }),
                     })
                     .await;
             }
@@ -1561,12 +1823,21 @@ async fn run_task(
             .collect::<Vec<ResponseItem>>();
         sess.record_conversation_items(&pending_input).await;
 
-        // Construct the input that we will send to the model. When using the
-        // Chat completions API (or ZDR clients), the model needs the full
-        // conversation history on each turn. The rollout file, however, should
-        // only record the new items that originated in this turn so that it
-        // represents an append-only log without duplicates.
-        let turn_input: Vec<ResponseItem> = sess.turn_input_with_history(pending_input);
+        // Construct the input that we will send to the model.
+        // In test mode (or when a branch point is set), prefer server-side
+        // context, so only send the new input for this turn. Otherwise, send
+        // the full conversation history.
+        let turn_input: Vec<ResponseItem> = {
+            let st = sess.state.lock_unchecked();
+            if st.test_mode || st.next_previous_response_id.is_some() {
+                let mut v = Vec::new();
+                v.extend(pending_input.clone());
+                v.push(initial_input_for_turn.clone().into());
+                v
+            } else {
+                sess.turn_input_with_history(pending_input)
+            }
+        };
 
         let turn_input_messages: Vec<String> = turn_input
             .iter()
@@ -1737,10 +2008,20 @@ async fn run_turn(
         Some(sess.mcp_connection_manager.list_all_tools()),
     );
 
+    // Respect test mode / branchpoint: prefer server-side context
+    let (store_override, previous_response_id) = {
+        let mut st = sess.state.lock_unchecked();
+        let prev = st.next_previous_response_id.take();
+        let use_server_ctx = st.test_mode || prev.is_some();
+        (use_server_ctx.then_some(true), prev)
+    };
+
     let prompt = Prompt {
         input,
         tools,
         base_instructions_override: turn_context.base_instructions.clone(),
+        store_override,
+        previous_response_id,
     };
 
     let mut retries = 0;
@@ -2014,6 +2295,8 @@ async fn run_compact_task(
         input: turn_input,
         tools: Vec::new(),
         base_instructions_override: Some(compact_instructions.clone()),
+        store_override: None,
+        previous_response_id: None,
     };
 
     let max_retries = turn_context.client.get_provider().stream_max_retries();
@@ -2140,6 +2423,13 @@ async fn run_compact_task(
         }),
     };
     sess.send_event(event).await;
+
+    // Rotate rollout file after a full compaction to prevent the rollout
+    // JSONL from growing without bound during long sessions.
+    let rec_opt = { sess.rollout.lock_unchecked().clone() };
+    if let Some(rec) = rec_opt {
+        let _ = rec.rotate("compact").await;
+    }
 }
 
 async fn handle_response_item(
@@ -3064,14 +3354,49 @@ async fn drain_to_completed(
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {
                 // Record only to in-memory conversation history; avoid state snapshot.
-                let mut state = sess.state.lock_unchecked();
-                state.history.record_items(std::slice::from_ref(&item));
+                {
+                    let mut state = sess.state.lock_unchecked();
+                    state.history.record_items(std::slice::from_ref(&item));
+                }
+                // In test mode, emit a micro-summary snapshot for user messages as they arrive.
+                let (should_log_user, summary_opt) = {
+                    let state = sess.state.lock_unchecked();
+                    if state.test_mode {
+                        if let ResponseItem::Message { role, content, .. } = &item {
+                            if role == "user" {
+                                (true, Some(micro_summary_from_content(content.clone())))
+                            } else {
+                                (false, None)
+                            }
+                        } else {
+                            (false, None)
+                        }
+                    } else {
+                        (false, None)
+                    }
+                };
+                if should_log_user {
+                    if let Some(summary) = summary_opt {
+                        let rec_opt = { sess.rollout.lock_unchecked().clone() };
+                        if let Some(rec) = rec_opt {
+                            let _ = rec
+                                .record_state(crate::rollout::SessionStateSnapshot {
+                                    rid: None,
+                                    note: Some("user".into()),
+                                    summary: Some(summary),
+                                    kind: Some("user".into()),
+                                })
+                                .await;
+                        }
+                    }
+                }
             }
             Ok(ResponseEvent::Completed {
-                response_id: _,
+                response_id,
                 token_usage,
             }) => {
-                let info = {
+                // Update token info and record response id while holding the lock only briefly.
+                let (info, test_mode_enabled) = {
                     let mut st = sess.state.lock_unchecked();
                     let info = TokenUsageInfo::new_or_append(
                         &st.token_info,
@@ -3079,8 +3404,50 @@ async fn drain_to_completed(
                         turn_context.client.get_model_context_window(),
                     );
                     st.token_info = info.clone();
-                    info
+                    st.response_ids.push(response_id.clone());
+                    (info, st.test_mode)
                 };
+
+                // In test mode, write a lightweight state marker with micro-summary.
+                if test_mode_enabled {
+                    // Extract a short summary from the last assistant message.
+                    let summary = {
+                        let st = sess.state.lock_unchecked();
+                        let last_msg =
+                            st.history
+                                .contents()
+                                .into_iter()
+                                .rev()
+                                .find_map(|ri| match ri {
+                                    ResponseItem::Message { role, content, .. }
+                                        if role == "assistant" =>
+                                    {
+                                        Some(content.clone())
+                                    }
+                                    _ => None,
+                                });
+                        last_msg
+                            .map(micro_summary_from_content)
+                            .unwrap_or_else(|| "assistant".to_string())
+                    };
+                    // Persist summary and rid to in-memory state for listing.
+                    {
+                        let mut st = sess.state.lock_unchecked();
+                        st.response_summaries
+                            .insert(response_id.clone(), summary.clone());
+                    }
+                    let rec_opt = { sess.rollout.lock_unchecked().clone() };
+                    if let Some(rec) = rec_opt {
+                        let _ = rec
+                            .record_state(crate::rollout::SessionStateSnapshot {
+                                rid: Some(response_id.clone()),
+                                note: Some("assistant".into()),
+                                summary: Some(summary),
+                                kind: Some("assistant".into()),
+                            })
+                            .await;
+                    }
+                }
 
                 sess.tx_event
                     .send(Event {

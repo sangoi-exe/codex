@@ -84,6 +84,8 @@ pub(crate) struct ChatComposer {
     // When true, disables paste-burst logic and inserts characters immediately.
     disable_paste_burst: bool,
     custom_prompts: Vec<CustomPrompt>,
+    // Raw first line of the last dispatched slash command (captures args).
+    last_command_line: Option<String>,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -122,6 +124,7 @@ impl ChatComposer {
             paste_burst: PasteBurst::default(),
             disable_paste_burst: false,
             custom_prompts: Vec::new(),
+            last_command_line: None,
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -326,6 +329,10 @@ impl ChatComposer {
         result
     }
 
+    pub(crate) fn take_last_command_line(&mut self) -> Option<String> {
+        self.last_command_line.take()
+    }
+
     /// Return true if either the slash-command popup or the file-search popup is active.
     pub(crate) fn popup_active(&self) -> bool {
         !matches!(self.active_popup, ActivePopup::None)
@@ -399,6 +406,15 @@ impl ChatComposer {
                 ..
             } => {
                 if let Some(sel) = popup.selected_item() {
+                    // Capture first line before clearing so we can extract any arguments.
+                    let first_line = self
+                        .textarea
+                        .text()
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    self.last_command_line = Some(first_line);
                     // Clear textarea so no residual text remains.
                     self.textarea.set_text("");
                     // Capture any needed data from popup before clearing it.

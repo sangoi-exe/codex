@@ -31,6 +31,16 @@ pub struct Prompt {
 
     /// Optional override for the built-in BASE_INSTRUCTIONS.
     pub base_instructions_override: Option<String>,
+
+    /// Optional override for the `store` flag in Responses API requests.
+    /// When `Some(true)`, the provider may retain server-side context, which
+    /// can be referenced via `previous_response_id` in subsequent turns.
+    pub store_override: Option<bool>,
+
+    /// When set, instructs the provider to resume from the referenced
+    /// `response_id` on the server side rather than relying on full local
+    /// history in the `input`.
+    pub previous_response_id: Option<String>,
 }
 
 impl Prompt {
@@ -132,6 +142,8 @@ pub(crate) struct ResponsesApiRequest<'a> {
     pub(crate) prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) text: Option<TextControls>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_response_id: Option<String>,
 }
 
 pub(crate) fn create_reasoning_param_for_request(
@@ -202,6 +214,7 @@ mod tests {
             text: Some(TextControls {
                 verbosity: Some(OpenAiVerbosity::Low),
             }),
+            previous_response_id: None,
         };
 
         let v = serde_json::to_value(&req).expect("json");
@@ -230,6 +243,7 @@ mod tests {
             include: vec![],
             prompt_cache_key: None,
             text: None,
+            previous_response_id: None,
         };
 
         let v = serde_json::to_value(&req).expect("json");

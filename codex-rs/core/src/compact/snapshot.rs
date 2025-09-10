@@ -1,7 +1,10 @@
-use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use serde::Deserialize;
+use serde::Serialize;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) struct SummaryV1 {
@@ -42,7 +45,10 @@ pub(crate) struct Symbol {
 }
 
 /// Persist `SummaryV1` to `<codex_home>/session.json` using an atomic write.
-pub(crate) fn persist_snapshot_atomic(codex_home: &Path, snapshot: &SummaryV1) -> std::io::Result<PathBuf> {
+pub(crate) fn persist_snapshot_atomic(
+    codex_home: &Path,
+    snapshot: &SummaryV1,
+) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(codex_home)?;
     let final_path = codex_home.join("session.json");
     let tmp_path = codex_home.join("session.json.tmp");

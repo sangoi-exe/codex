@@ -224,6 +224,10 @@ impl BottomPane {
         }
     }
 
+    pub fn take_last_command_line(&mut self) -> Option<String> {
+        self.composer.take_last_command_line()
+    }
+
     pub(crate) fn insert_str(&mut self, text: &str) {
         self.composer.insert_str(text);
         self.request_redraw();
