@@ -45,6 +45,7 @@ pub(crate) struct Symbol {
 }
 
 /// Persist `SummaryV1` to `<codex_home>/session.json` using an atomic write.
+#[allow(dead_code)]
 pub(crate) fn persist_snapshot_atomic(
     codex_home: &Path,
     snapshot: &SummaryV1,

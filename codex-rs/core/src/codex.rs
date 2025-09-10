@@ -1473,7 +1473,7 @@ async fn submission_loop(
                 let temp_client = turn_context
                     .client
                     .clone_with_session_id(uuid::Uuid::new_v4());
-                let mut temp_turn_context = TurnContext {
+                let temp_turn_context = TurnContext {
                     client: temp_client,
                     tools_config: turn_context.tools_config.clone(),
                     user_instructions: turn_context.user_instructions.clone(),

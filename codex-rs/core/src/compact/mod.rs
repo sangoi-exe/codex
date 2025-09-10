@@ -9,8 +9,6 @@ mod snapshot;
 
 pub(crate) use estimate::CompactionReport;
 pub(crate) use estimate::estimate_tokens_for_items;
-pub(crate) use snapshot::SummaryV1;
-pub(crate) use snapshot::persist_snapshot_atomic;
 
 /// Format a short, human-friendly completion message for the compaction step.
 ///
