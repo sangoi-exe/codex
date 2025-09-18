@@ -1,3 +1,4 @@
+use crate::McpServerFeatureFlags;
 use crate::error_code::INTERNAL_ERROR_CODE;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::json_to_toml::json_to_toml;
@@ -66,6 +67,7 @@ use codex_protocol::mcp_protocol::LoginChatGptCompleteNotification;
 use codex_protocol::mcp_protocol::LoginChatGptResponse;
 use codex_protocol::mcp_protocol::NewConversationParams;
 use codex_protocol::mcp_protocol::NewConversationResponse;
+use codex_protocol::mcp_protocol::ResumeConversationResponse;
 use codex_protocol::mcp_protocol::RemoveConversationListenerParams;
 use codex_protocol::mcp_protocol::RemoveConversationSubscriptionResponse;
 use codex_protocol::mcp_protocol::ResumeConversationParams;
@@ -82,8 +84,12 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InputMessageKind;
 use codex_protocol::protocol::USER_MESSAGE_BEGIN;
+use mcp_types::CallToolResult;
+use mcp_types::ContentBlock;
+use mcp_types::TextContent;
 use mcp_types::JSONRPCErrorError;
 use mcp_types::RequestId;
+use serde_json::json;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -111,6 +117,12 @@ impl ActiveLogin {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum PendingInterrupt {
+    JsonRpc(RequestId),
+    Tool(RequestId),
+}
+
 /// Handles JSON-RPC messages for Codex conversations.
 pub(crate) struct CodexMessageProcessor {
     auth_manager: Arc<AuthManager>,
@@ -121,7 +133,8 @@ pub(crate) struct CodexMessageProcessor {
     conversation_listeners: HashMap<Uuid, oneshot::Sender<()>>,
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
     // Queue of pending interrupt requests per conversation. We reply when TurnAborted arrives.
-    pending_interrupts: Arc<Mutex<HashMap<ConversationId, Vec<RequestId>>>>,
+    pending_interrupts: Arc<Mutex<HashMap<ConversationId, Vec<PendingInterrupt>>>>,
+    _feature_flags: McpServerFeatureFlags,
 }
 
 impl CodexMessageProcessor {
@@ -131,6 +144,7 @@ impl CodexMessageProcessor {
         outgoing: Arc<OutgoingMessageSender>,
         codex_linux_sandbox_exe: Option<PathBuf>,
         config: Arc<Config>,
+        feature_flags: McpServerFeatureFlags,
     ) -> Self {
         Self {
             auth_manager,
@@ -141,6 +155,7 @@ impl CodexMessageProcessor {
             conversation_listeners: HashMap::new(),
             active_login: Arc::new(Mutex::new(None)),
             pending_interrupts: Arc::new(Mutex::new(HashMap::new())),
+            _feature_flags: feature_flags,
         }
     }
 
@@ -213,6 +228,16 @@ impl CodexMessageProcessor {
     }
 
     async fn login_api_key(&mut self, request_id: RequestId, params: LoginApiKeyParams) {
+        match self.login_api_key_internal(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(err) => self.outgoing.send_error(request_id, err).await,
+        }
+    }
+
+    pub(crate) async fn login_api_key_internal(
+        &self,
+        params: LoginApiKeyParams,
+    ) -> Result<LoginApiKeyResponse, JSONRPCErrorError> {
         {
             let mut guard = self.active_login.lock().await;
             if let Some(active) = guard.take() {
@@ -223,29 +248,32 @@ impl CodexMessageProcessor {
         match login_with_api_key(&self.config.codex_home, &params.api_key) {
             Ok(()) => {
                 self.auth_manager.reload();
-                self.outgoing
-                    .send_response(request_id, LoginApiKeyResponse {})
-                    .await;
-
                 let payload = AuthStatusChangeNotification {
                     auth_method: self.auth_manager.auth().map(|auth| auth.mode),
                 };
                 self.outgoing
                     .send_server_notification(ServerNotification::AuthStatusChange(payload))
                     .await;
+                Ok(LoginApiKeyResponse {})
             }
-            Err(err) => {
-                let error = JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!("failed to save api key: {err}"),
-                    data: None,
-                };
-                self.outgoing.send_error(request_id, error).await;
-            }
+            Err(err) => Err(JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("failed to save api key: {err}"),
+                data: None,
+            }),
         }
     }
 
     async fn login_chatgpt(&mut self, request_id: RequestId) {
+        match self.login_chatgpt_internal().await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(err) => self.outgoing.send_error(request_id, err).await,
+        }
+    }
+
+    pub(crate) async fn login_chatgpt_internal(
+        &self,
+    ) -> Result<LoginChatGptResponse, JSONRPCErrorError> {
         let config = self.config.as_ref();
 
         let opts = LoginServerOptions {
@@ -253,152 +281,127 @@ impl CodexMessageProcessor {
             ..LoginServerOptions::new(config.codex_home.clone(), CLIENT_ID.to_string())
         };
 
-        enum LoginChatGptReply {
-            Response(LoginChatGptResponse),
-            Error(JSONRPCErrorError),
+        let server = run_login_server(opts).map_err(|err| JSONRPCErrorError {
+            code: INTERNAL_ERROR_CODE,
+            message: format!("failed to start login server: {err}"),
+            data: None,
+        })?;
+
+        let login_id = Uuid::new_v4();
+        let shutdown_handle = server.cancel_handle();
+
+        {
+            let mut guard = self.active_login.lock().await;
+            if let Some(existing) = guard.take() {
+                existing.drop();
+            }
+            *guard = Some(ActiveLogin {
+                shutdown_handle: shutdown_handle.clone(),
+                login_id,
+            });
         }
 
-        let reply = match run_login_server(opts) {
-            Ok(server) => {
-                let login_id = Uuid::new_v4();
-                let shutdown_handle = server.cancel_handle();
-
-                // Replace active login if present.
-                {
-                    let mut guard = self.active_login.lock().await;
-                    if let Some(existing) = guard.take() {
-                        existing.drop();
-                    }
-                    *guard = Some(ActiveLogin {
-                        shutdown_handle: shutdown_handle.clone(),
-                        login_id,
-                    });
-                }
-
-                let response = LoginChatGptResponse {
-                    login_id,
-                    auth_url: server.auth_url.clone(),
-                };
-
-                // Spawn background task to monitor completion.
-                let outgoing_clone = self.outgoing.clone();
-                let active_login = self.active_login.clone();
-                let auth_manager = self.auth_manager.clone();
-                tokio::spawn(async move {
-                    let (success, error_msg) = match tokio::time::timeout(
-                        LOGIN_CHATGPT_TIMEOUT,
-                        server.block_until_done(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => (true, None),
-                        Ok(Err(err)) => (false, Some(format!("Login server error: {err}"))),
-                        Err(_elapsed) => {
-                            // Timeout: cancel server and report
-                            shutdown_handle.shutdown();
-                            (false, Some("Login timed out".to_string()))
-                        }
-                    };
-                    let payload = LoginChatGptCompleteNotification {
-                        login_id,
-                        success,
-                        error: error_msg,
-                    };
-                    outgoing_clone
-                        .send_server_notification(ServerNotification::LoginChatGptComplete(payload))
-                        .await;
-
-                    // Send an auth status change notification.
-                    if success {
-                        // Update in-memory auth cache now that login completed.
-                        auth_manager.reload();
-
-                        // Notify clients with the actual current auth mode.
-                        let current_auth_method = auth_manager.auth().map(|a| a.mode);
-                        let payload = AuthStatusChangeNotification {
-                            auth_method: current_auth_method,
-                        };
-                        outgoing_clone
-                            .send_server_notification(ServerNotification::AuthStatusChange(payload))
-                            .await;
-                    }
-
-                    // Clear the active login if it matches this attempt. It may have been replaced or cancelled.
-                    let mut guard = active_login.lock().await;
-                    if guard.as_ref().map(|l| l.login_id) == Some(login_id) {
-                        *guard = None;
-                    }
-                });
-
-                LoginChatGptReply::Response(response)
-            }
-            Err(err) => LoginChatGptReply::Error(JSONRPCErrorError {
-                code: INTERNAL_ERROR_CODE,
-                message: format!("failed to start login server: {err}"),
-                data: None,
-            }),
+        let response = LoginChatGptResponse {
+            login_id,
+            auth_url: server.auth_url.clone(),
         };
 
-        match reply {
-            LoginChatGptReply::Response(resp) => {
-                self.outgoing.send_response(request_id, resp).await
+        let outgoing_clone = self.outgoing.clone();
+        let active_login = self.active_login.clone();
+        let auth_manager = self.auth_manager.clone();
+        tokio::spawn(async move {
+            let (success, error_msg) = match tokio::time::timeout(
+                LOGIN_CHATGPT_TIMEOUT,
+                server.block_until_done(),
+            )
+            .await
+            {
+                Ok(Ok(())) => (true, None),
+                Ok(Err(err)) => (false, Some(format!("Login server error: {err}"))),
+                Err(_elapsed) => {
+                    shutdown_handle.shutdown();
+                    (false, Some("Login timed out".to_string()))
+                }
+            };
+            let payload = LoginChatGptCompleteNotification {
+                login_id,
+                success,
+                error: error_msg,
+            };
+            outgoing_clone
+                .send_server_notification(ServerNotification::LoginChatGptComplete(payload))
+                .await;
+
+            if success {
+                auth_manager.reload();
+                let auth_method = auth_manager.auth().map(|a| a.mode);
+                outgoing_clone
+                    .send_server_notification(ServerNotification::AuthStatusChange(
+                        AuthStatusChangeNotification { auth_method },
+                    ))
+                    .await;
             }
-            LoginChatGptReply::Error(err) => self.outgoing.send_error(request_id, err).await,
-        }
+
+            let mut guard = active_login.lock().await;
+            if guard.as_ref().map(|l| l.login_id) == Some(login_id) {
+                *guard = None;
+            }
+        });
+
+        Ok(response)
     }
 
     async fn cancel_login_chatgpt(&mut self, request_id: RequestId, login_id: Uuid) {
+        match self.cancel_login_chatgpt_internal(login_id).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(err) => self.outgoing.send_error(request_id, err).await,
+        }
+    }
+
+    pub(crate) async fn cancel_login_chatgpt_internal(
+        &self,
+        login_id: Uuid,
+    ) -> Result<codex_protocol::mcp_protocol::CancelLoginChatGptResponse, JSONRPCErrorError> {
         let mut guard = self.active_login.lock().await;
         if guard.as_ref().map(|l| l.login_id) == Some(login_id) {
             if let Some(active) = guard.take() {
                 active.drop();
             }
-            drop(guard);
-            self.outgoing
-                .send_response(
-                    request_id,
-                    codex_protocol::mcp_protocol::CancelLoginChatGptResponse {},
-                )
-                .await;
+            Ok(codex_protocol::mcp_protocol::CancelLoginChatGptResponse {})
         } else {
-            drop(guard);
-            let error = JSONRPCErrorError {
+            Err(JSONRPCErrorError {
                 code: INVALID_REQUEST_ERROR_CODE,
                 message: format!("login id not found: {login_id}"),
                 data: None,
-            };
-            self.outgoing.send_error(request_id, error).await;
+            })
         }
     }
 
     async fn logout_chatgpt(&mut self, request_id: RequestId) {
+        match self.logout_chatgpt_internal().await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(err) => self.outgoing.send_error(request_id, err).await,
+        }
+    }
+
+    pub(crate) async fn logout_chatgpt_internal(
+        &self,
+    ) -> Result<codex_protocol::mcp_protocol::LogoutChatGptResponse, JSONRPCErrorError> {
         {
-            // Cancel any active login attempt.
             let mut guard = self.active_login.lock().await;
             if let Some(active) = guard.take() {
                 active.drop();
             }
         }
 
-        if let Err(err) = self.auth_manager.logout() {
-            let error = JSONRPCErrorError {
+        self.auth_manager
+            .logout()
+            .map_err(|err| JSONRPCErrorError {
                 code: INTERNAL_ERROR_CODE,
                 message: format!("logout failed: {err}"),
                 data: None,
-            };
-            self.outgoing.send_error(request_id, error).await;
-            return;
-        }
+            })?;
 
-        self.outgoing
-            .send_response(
-                request_id,
-                codex_protocol::mcp_protocol::LogoutChatGptResponse {},
-            )
-            .await;
-
-        // Send auth status change notification reflecting the current auth mode
-        // after logout.
         let current_auth_method = self.auth_manager.auth().map(|auth| auth.mode);
         let payload = AuthStatusChangeNotification {
             auth_method: current_auth_method,
@@ -406,6 +409,8 @@ impl CodexMessageProcessor {
         self.outgoing
             .send_server_notification(ServerNotification::AuthStatusChange(payload))
             .await;
+
+        Ok(codex_protocol::mcp_protocol::LogoutChatGptResponse {})
     }
 
     async fn get_auth_status(
@@ -413,6 +418,16 @@ impl CodexMessageProcessor {
         request_id: RequestId,
         params: codex_protocol::mcp_protocol::GetAuthStatusParams,
     ) {
+        match self.get_auth_status_internal(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(err) => self.outgoing.send_error(request_id, err).await,
+        }
+    }
+
+    pub(crate) async fn get_auth_status_internal(
+        &self,
+        params: codex_protocol::mcp_protocol::GetAuthStatusParams,
+    ) -> Result<codex_protocol::mcp_protocol::GetAuthStatusResponse, JSONRPCErrorError> {
         let include_token = params.include_token.unwrap_or(false);
         let do_refresh = params.refresh_token.unwrap_or(false);
 
@@ -460,63 +475,83 @@ impl CodexMessageProcessor {
             }
         };
 
-        self.outgoing.send_response(request_id, response).await;
+        Ok(response)
     }
 
     async fn get_user_agent(&self, request_id: RequestId) {
-        let user_agent = get_codex_user_agent();
-        let response = GetUserAgentResponse { user_agent };
-        self.outgoing.send_response(request_id, response).await;
+        match self.get_user_agent_internal() {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(err) => self.outgoing.send_error(request_id, err).await,
+        }
+    }
+
+    pub(crate) fn get_user_agent_internal(
+        &self,
+    ) -> Result<GetUserAgentResponse, JSONRPCErrorError> {
+        Ok(GetUserAgentResponse {
+            user_agent: get_codex_user_agent(),
+        })
     }
 
     async fn get_user_saved_config(&self, request_id: RequestId) {
-        let toml_value = match load_config_as_toml(&self.config.codex_home) {
-            Ok(val) => val,
-            Err(err) => {
-                let error = JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!("failed to load config.toml: {err}"),
-                    data: None,
-                };
-                self.outgoing.send_error(request_id, error).await;
-                return;
-            }
-        };
+        match self.get_user_saved_config_internal().await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(err) => self.outgoing.send_error(request_id, err).await,
+        }
+    }
 
-        let cfg: ConfigToml = match toml_value.try_into() {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                let error = JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!("failed to parse config.toml: {err}"),
-                    data: None,
-                };
-                self.outgoing.send_error(request_id, error).await;
-                return;
-            }
-        };
+    pub(crate) async fn get_user_saved_config_internal(
+        &self,
+    ) -> Result<GetUserSavedConfigResponse, JSONRPCErrorError> {
+        let toml_value =
+            load_config_as_toml(&self.config.codex_home).map_err(|err| JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("failed to load config.toml: {err}"),
+                data: None,
+            })?;
+
+        let cfg: ConfigToml = toml_value.try_into().map_err(|err| JSONRPCErrorError {
+            code: INTERNAL_ERROR_CODE,
+            message: format!("failed to parse config.toml: {err}"),
+            data: None,
+        })?;
 
         let user_saved_config: UserSavedConfig = cfg.into();
 
-        let response = GetUserSavedConfigResponse {
+        Ok(GetUserSavedConfigResponse {
             config: user_saved_config,
-        };
-        self.outgoing.send_response(request_id, response).await;
+        })
     }
 
     async fn get_user_info(&self, request_id: RequestId) {
-        // Read alleged user email from auth.json (best-effort; not verified).
-        let auth_path = get_auth_file(&self.config.codex_home);
-        let alleged_user_email = match try_read_auth_json(&auth_path) {
-            Ok(auth) => auth.tokens.and_then(|t| t.id_token.email),
-            Err(_) => None,
-        };
+        match self.get_user_info_internal().await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(err) => self.outgoing.send_error(request_id, err).await,
+        }
+    }
 
-        let response = UserInfoResponse { alleged_user_email };
-        self.outgoing.send_response(request_id, response).await;
+    pub(crate) async fn get_user_info_internal(
+        &self,
+    ) -> Result<UserInfoResponse, JSONRPCErrorError> {
+        let auth_path = get_auth_file(&self.config.codex_home);
+        let alleged_user_email = try_read_auth_json(&auth_path)
+            .ok()
+            .and_then(|auth| auth.tokens.and_then(|t| t.id_token.email));
+
+        Ok(UserInfoResponse { alleged_user_email })
     }
 
     async fn set_default_model(&self, request_id: RequestId, params: SetDefaultModelParams) {
+        match self.set_default_model_internal(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(err) => self.outgoing.send_error(request_id, err).await,
+        }
+    }
+
+    pub(crate) async fn set_default_model_internal(
+        &self,
+        params: SetDefaultModelParams,
+    ) -> Result<SetDefaultModelResponse, JSONRPCErrorError> {
         let SetDefaultModelParams {
             model,
             reasoning_effort,
@@ -528,39 +563,40 @@ impl CodexMessageProcessor {
             (&[CONFIG_KEY_EFFORT], effort_str.as_deref()),
         ];
 
-        match persist_overrides_and_clear_if_none(
+        persist_overrides_and_clear_if_none(
             &self.config.codex_home,
             self.config.active_profile.as_deref(),
             &overrides,
         )
         .await
-        {
-            Ok(()) => {
-                let response = SetDefaultModelResponse {};
-                self.outgoing.send_response(request_id, response).await;
-            }
-            Err(err) => {
-                let error = JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!("failed to persist overrides: {err}"),
-                    data: None,
-                };
-                self.outgoing.send_error(request_id, error).await;
-            }
-        }
+        .map_err(|err| JSONRPCErrorError {
+            code: INTERNAL_ERROR_CODE,
+            message: format!("failed to persist overrides: {err}"),
+            data: None,
+        })?;
+
+        Ok(SetDefaultModelResponse {})
     }
 
     async fn exec_one_off_command(&self, request_id: RequestId, params: ExecOneOffCommandParams) {
+        match self.exec_one_off_command_internal(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(err) => self.outgoing.send_error(request_id, err).await,
+        }
+    }
+
+    pub(crate) async fn exec_one_off_command_internal(
+        &self,
+        params: ExecOneOffCommandParams,
+    ) -> Result<ExecArbitraryCommandResponse, JSONRPCErrorError> {
         tracing::debug!("ExecOneOffCommand params: {params:?}");
 
         if params.command.is_empty() {
-            let error = JSONRPCErrorError {
+            return Err(JSONRPCErrorError {
                 code: INVALID_REQUEST_ERROR_CODE,
                 message: "command must not be empty".to_string(),
                 data: None,
-            };
-            self.outgoing.send_error(request_id, error).await;
-            return;
+            });
         }
 
         let cwd = params.cwd.unwrap_or_else(|| self.config.cwd.clone());
@@ -586,77 +622,62 @@ impl CodexMessageProcessor {
             _ => get_platform_sandbox().unwrap_or(codex_core::exec::SandboxType::None),
         };
         tracing::debug!("Sandbox type: {sandbox_type:?}");
-        let codex_linux_sandbox_exe = self.config.codex_linux_sandbox_exe.clone();
-        let outgoing = self.outgoing.clone();
-        let req_id = request_id;
+        let codex_linux_sandbox_exe = self.codex_linux_sandbox_exe.clone();
 
-        tokio::spawn(async move {
-            match codex_core::exec::process_exec_tool_call(
-                exec_params,
-                sandbox_type,
-                &effective_policy,
-                &codex_linux_sandbox_exe,
-                None,
-            )
-            .await
-            {
-                Ok(output) => {
-                    let response = ExecArbitraryCommandResponse {
-                        exit_code: output.exit_code,
-                        stdout: output.stdout.text,
-                        stderr: output.stderr.text,
-                    };
-                    outgoing.send_response(req_id, response).await;
-                }
-                Err(err) => {
-                    let error = JSONRPCErrorError {
-                        code: INTERNAL_ERROR_CODE,
-                        message: format!("exec failed: {err}"),
-                        data: None,
-                    };
-                    outgoing.send_error(req_id, error).await;
-                }
-            }
-        });
+        codex_core::exec::process_exec_tool_call(
+            exec_params,
+            sandbox_type,
+            &effective_policy,
+            &codex_linux_sandbox_exe,
+            None,
+        )
+        .await
+        .map(|output| ExecArbitraryCommandResponse {
+            exit_code: output.exit_code,
+            stdout: output.stdout.text,
+            stderr: output.stderr.text,
+        })
+        .map_err(|err| JSONRPCErrorError {
+            code: INTERNAL_ERROR_CODE,
+            message: format!("exec failed: {err}"),
+            data: None,
+        })
     }
 
     async fn process_new_conversation(&self, request_id: RequestId, params: NewConversationParams) {
-        let config = match derive_config_from_params(params, self.codex_linux_sandbox_exe.clone()) {
-            Ok(config) => config,
-            Err(err) => {
-                let error = JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: format!("error deriving config: {err}"),
-                    data: None,
-                };
-                self.outgoing.send_error(request_id, error).await;
-                return;
-            }
-        };
+        match self.new_conversation_internal(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    pub(crate) async fn new_conversation_internal(
+        &self,
+        params: NewConversationParams,
+    ) -> Result<NewConversationResponse, JSONRPCErrorError> {
+        let config = derive_config_from_params(params, self.codex_linux_sandbox_exe.clone())
+            .map_err(|err| JSONRPCErrorError {
+                code: INVALID_REQUEST_ERROR_CODE,
+                message: format!("error deriving config: {err}"),
+                data: None,
+            })?;
 
         match self.conversation_manager.new_conversation(config).await {
-            Ok(conversation_id) => {
-                let NewConversation {
-                    conversation_id,
-                    session_configured,
-                    ..
-                } = conversation_id;
-                let response = NewConversationResponse {
-                    conversation_id,
-                    model: session_configured.model,
-                    reasoning_effort: session_configured.reasoning_effort,
-                    rollout_path: session_configured.rollout_path,
-                };
-                self.outgoing.send_response(request_id, response).await;
-            }
-            Err(err) => {
-                let error = JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!("error creating conversation: {err}"),
-                    data: None,
-                };
-                self.outgoing.send_error(request_id, error).await;
-            }
+            Ok(NewConversation {
+                conversation_id,
+                session_configured,
+                ..
+            }) => Ok(NewConversationResponse {
+                conversation_id,
+                model: session_configured.model,
+                reasoning_effort: session_configured.reasoning_effort,
+                rollout_path: session_configured.rollout_path,
+            }),
+            Err(err) => Err(JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("error creating conversation: {err}"),
+                data: None,
+            }),
         }
     }
 
@@ -665,6 +686,16 @@ impl CodexMessageProcessor {
         request_id: RequestId,
         params: ListConversationsParams,
     ) {
+        match self.list_conversations_internal(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(err) => self.outgoing.send_error(request_id, err).await,
+        }
+    }
+
+    pub(crate) async fn list_conversations_internal(
+        &self,
+        params: ListConversationsParams,
+    ) -> Result<ListConversationsResponse, JSONRPCErrorError> {
         let page_size = params.page_size.unwrap_or(25);
         // Decode the optional cursor string to a Cursor via serde (Cursor implements Deserialize from string)
         let cursor_obj: Option<RolloutCursor> = match params.cursor {
@@ -673,24 +704,14 @@ impl CodexMessageProcessor {
         };
         let cursor_ref = cursor_obj.as_ref();
 
-        let page = match RolloutRecorder::list_conversations(
-            &self.config.codex_home,
-            page_size,
-            cursor_ref,
-        )
-        .await
-        {
-            Ok(p) => p,
-            Err(err) => {
-                let error = JSONRPCErrorError {
+        let page =
+            RolloutRecorder::list_conversations(&self.config.codex_home, page_size, cursor_ref)
+                .await
+                .map_err(|err| JSONRPCErrorError {
                     code: INTERNAL_ERROR_CODE,
                     message: format!("failed to list conversations: {err}"),
                     data: None,
-                };
-                self.outgoing.send_error(request_id, error).await;
-                return;
-            }
-        };
+                })?;
 
         let items = page
             .items
@@ -707,8 +728,7 @@ impl CodexMessageProcessor {
             None => None,
         };
 
-        let response = ListConversationsResponse { items, next_cursor };
-        self.outgoing.send_response(request_id, response).await;
+        Ok(ListConversationsResponse { items, next_cursor })
     }
 
     async fn handle_resume_conversation(
@@ -716,25 +736,33 @@ impl CodexMessageProcessor {
         request_id: RequestId,
         params: ResumeConversationParams,
     ) {
+        match self.resume_conversation_internal(params).await {
+            Ok((event, response)) => {
+                if let Some(event) = event {
+                    self.outgoing.send_event_as_notification(&event, None).await;
+                }
+                self.outgoing.send_response(request_id, response).await;
+            }
+            Err(err) => self.outgoing.send_error(request_id, err).await,
+        }
+    }
+
+    pub(crate) async fn resume_conversation_internal(
+        &self,
+        params: ResumeConversationParams,
+    ) -> Result<(Option<Event>, ResumeConversationResponse), JSONRPCErrorError> {
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let config = match params.overrides {
             Some(overrides) => {
                 derive_config_from_params(overrides, self.codex_linux_sandbox_exe.clone())
             }
             None => Ok(self.config.as_ref().clone()),
-        };
-        let config = match config {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                let error = JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: format!("error deriving config: {err}"),
-                    data: None,
-                };
-                self.outgoing.send_error(request_id, error).await;
-                return;
-            }
-        };
+        }
+        .map_err(|err| JSONRPCErrorError {
+            code: INVALID_REQUEST_ERROR_CODE,
+            message: format!("error deriving config: {err}"),
+            data: None,
+        })?;
 
         match self
             .conversation_manager
@@ -754,7 +782,6 @@ impl CodexMessageProcessor {
                     id: "".to_string(),
                     msg: EventMsg::SessionConfigured(session_configured.clone()),
                 };
-                self.outgoing.send_event_as_notification(&event, None).await;
                 let initial_messages = session_configured.initial_messages.map(|msgs| {
                     msgs.into_iter()
                         .filter(|event| {
@@ -768,26 +795,32 @@ impl CodexMessageProcessor {
                         .collect()
                 });
 
-                // Reply with conversation id + model and initial messages (when present)
-                let response = codex_protocol::mcp_protocol::ResumeConversationResponse {
+                let response = ResumeConversationResponse {
                     conversation_id,
                     model: session_configured.model.clone(),
                     initial_messages,
                 };
-                self.outgoing.send_response(request_id, response).await;
+                Ok((Some(event), response))
             }
-            Err(err) => {
-                let error = JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!("error resuming conversation: {err}"),
-                    data: None,
-                };
-                self.outgoing.send_error(request_id, error).await;
-            }
+            Err(err) => Err(JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("error resuming conversation: {err}"),
+                data: None,
+            }),
         }
     }
 
     async fn archive_conversation(&self, request_id: RequestId, params: ArchiveConversationParams) {
+        match self.archive_conversation_internal(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(err) => self.outgoing.send_error(request_id, err).await,
+        }
+    }
+
+    pub(crate) async fn archive_conversation_internal(
+        &self,
+        params: ArchiveConversationParams,
+    ) -> Result<ArchiveConversationResponse, JSONRPCErrorError> {
         let ArchiveConversationParams {
             conversation_id,
             rollout_path,
@@ -802,46 +835,40 @@ impl CodexMessageProcessor {
         {
             path
         } else {
-            let error = JSONRPCErrorError {
+            return Err(JSONRPCErrorError {
                 code: INVALID_REQUEST_ERROR_CODE,
                 message: format!(
                     "rollout path `{}` must be in sessions directory",
                     rollout_path.display()
                 ),
                 data: None,
-            };
-            self.outgoing.send_error(request_id, error).await;
-            return;
+            });
         };
 
         let required_suffix = format!("{conversation_id}.jsonl");
         let Some(file_name) = canonical_rollout_path.file_name().map(OsStr::to_owned) else {
-            let error = JSONRPCErrorError {
+            return Err(JSONRPCErrorError {
                 code: INVALID_REQUEST_ERROR_CODE,
                 message: format!(
                     "rollout path `{}` missing file name",
                     rollout_path.display()
                 ),
                 data: None,
-            };
-            self.outgoing.send_error(request_id, error).await;
-            return;
+            });
         };
 
         if !file_name
             .to_string_lossy()
             .ends_with(required_suffix.as_str())
         {
-            let error = JSONRPCErrorError {
+            return Err(JSONRPCErrorError {
                 code: INVALID_REQUEST_ERROR_CODE,
                 message: format!(
                     "rollout path `{}` does not match conversation id {conversation_id}",
                     rollout_path.display()
                 ),
                 data: None,
-            };
-            self.outgoing.send_error(request_id, error).await;
-            return;
+            });
         }
 
         let removed_conversation = self
@@ -907,39 +934,39 @@ impl CodexMessageProcessor {
         .await;
 
         match result {
-            Ok(()) => {
-                let response = ArchiveConversationResponse {};
-                self.outgoing.send_response(request_id, response).await;
-            }
-            Err(err) => {
-                let error = JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!("failed to archive conversation: {err}"),
-                    data: None,
-                };
-                self.outgoing.send_error(request_id, error).await;
-            }
+            Ok(()) => Ok(ArchiveConversationResponse {}),
+            Err(err) => Err(JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("failed to archive conversation: {err}"),
+                data: None,
+            }),
         }
     }
 
     async fn send_user_message(&self, request_id: RequestId, params: SendUserMessageParams) {
+        match self.send_user_message_internal(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(err) => self.outgoing.send_error(request_id, err).await,
+        }
+    }
+
+    pub(crate) async fn send_user_message_internal(
+        &self,
+        params: SendUserMessageParams,
+    ) -> Result<SendUserMessageResponse, JSONRPCErrorError> {
         let SendUserMessageParams {
             conversation_id,
             items,
         } = params;
-        let Ok(conversation) = self
+        let conversation = self
             .conversation_manager
             .get_conversation(conversation_id)
             .await
-        else {
-            let error = JSONRPCErrorError {
+            .map_err(|_| JSONRPCErrorError {
                 code: INVALID_REQUEST_ERROR_CODE,
                 message: format!("conversation not found: {conversation_id}"),
                 data: None,
-            };
-            self.outgoing.send_error(request_id, error).await;
-            return;
-        };
+            })?;
 
         let mapped_items: Vec<CoreInputItem> = items
             .into_iter()
@@ -950,20 +977,26 @@ impl CodexMessageProcessor {
             })
             .collect();
 
-        // Submit user input to the conversation.
         let _ = conversation
             .submit(Op::UserInput {
                 items: mapped_items,
             })
             .await;
 
-        // Acknowledge with an empty result.
-        self.outgoing
-            .send_response(request_id, SendUserMessageResponse {})
-            .await;
+        Ok(SendUserMessageResponse {})
     }
 
     async fn send_user_turn(&self, request_id: RequestId, params: SendUserTurnParams) {
+        match self.send_user_turn_internal(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(err) => self.outgoing.send_error(request_id, err).await,
+        }
+    }
+
+    pub(crate) async fn send_user_turn_internal(
+        &self,
+        params: SendUserTurnParams,
+    ) -> Result<SendUserTurnResponse, JSONRPCErrorError> {
         let SendUserTurnParams {
             conversation_id,
             items,
@@ -975,19 +1008,15 @@ impl CodexMessageProcessor {
             summary,
         } = params;
 
-        let Ok(conversation) = self
+        let conversation = self
             .conversation_manager
             .get_conversation(conversation_id)
             .await
-        else {
-            let error = JSONRPCErrorError {
+            .map_err(|_| JSONRPCErrorError {
                 code: INVALID_REQUEST_ERROR_CODE,
                 message: format!("conversation not found: {conversation_id}"),
                 data: None,
-            };
-            self.outgoing.send_error(request_id, error).await;
-            return;
-        };
+            })?;
 
         let mapped_items: Vec<CoreInputItem> = items
             .into_iter()
@@ -1010,9 +1039,7 @@ impl CodexMessageProcessor {
             })
             .await;
 
-        self.outgoing
-            .send_response(request_id, SendUserTurnResponse {})
-            .await;
+        Ok(SendUserTurnResponse {})
     }
 
     async fn interrupt_conversation(
@@ -1021,28 +1048,39 @@ impl CodexMessageProcessor {
         params: InterruptConversationParams,
     ) {
         let InterruptConversationParams { conversation_id } = params;
-        let Ok(conversation) = self
+        if let Err(err) = self
+            .schedule_interrupt(
+                conversation_id,
+                PendingInterrupt::JsonRpc(request_id.clone()),
+            )
+            .await
+        {
+            self.outgoing.send_error(request_id, err).await;
+        }
+    }
+
+    pub(crate) async fn schedule_interrupt(
+        &self,
+        conversation_id: ConversationId,
+        pending: PendingInterrupt,
+    ) -> Result<(), JSONRPCErrorError> {
+        let conversation = self
             .conversation_manager
             .get_conversation(conversation_id)
             .await
-        else {
-            let error = JSONRPCErrorError {
+            .map_err(|_| JSONRPCErrorError {
                 code: INVALID_REQUEST_ERROR_CODE,
                 message: format!("conversation not found: {conversation_id}"),
                 data: None,
-            };
-            self.outgoing.send_error(request_id, error).await;
-            return;
-        };
+            })?;
 
-        // Record the pending interrupt so we can reply when TurnAborted arrives.
         {
             let mut map = self.pending_interrupts.lock().await;
-            map.entry(conversation_id).or_default().push(request_id);
+            map.entry(conversation_id).or_default().push(pending);
         }
 
-        // Submit the interrupt; we'll respond upon TurnAborted.
         let _ = conversation.submit(Op::Interrupt).await;
+        Ok(())
     }
 
     async fn add_conversation_listener(
@@ -1145,23 +1183,26 @@ impl CodexMessageProcessor {
     }
 
     async fn git_diff_to_origin(&self, request_id: RequestId, cwd: PathBuf) {
-        let diff = git_diff_to_remote(&cwd).await;
-        match diff {
-            Some(value) => {
-                let response = GitDiffToRemoteResponse {
-                    sha: value.sha,
-                    diff: value.diff,
-                };
-                self.outgoing.send_response(request_id, response).await;
-            }
-            None => {
-                let error = JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: format!("failed to compute git diff to remote for cwd: {cwd:?}"),
-                    data: None,
-                };
-                self.outgoing.send_error(request_id, error).await;
-            }
+        match self.git_diff_to_origin_internal(cwd).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(err) => self.outgoing.send_error(request_id, err).await,
+        }
+    }
+
+    pub(crate) async fn git_diff_to_origin_internal(
+        &self,
+        cwd: PathBuf,
+    ) -> Result<GitDiffToRemoteResponse, JSONRPCErrorError> {
+        match git_diff_to_remote(&cwd).await {
+            Some(value) => Ok(GitDiffToRemoteResponse {
+                sha: value.sha,
+                diff: value.diff,
+            }),
+            None => Err(JSONRPCErrorError {
+                code: INVALID_REQUEST_ERROR_CODE,
+                message: format!("failed to compute git diff to remote for cwd: {cwd:?}"),
+                data: None,
+            }),
         }
     }
 }
@@ -1171,7 +1212,7 @@ async fn apply_bespoke_event_handling(
     conversation_id: ConversationId,
     conversation: Arc<CodexConversation>,
     outgoing: Arc<OutgoingMessageSender>,
-    pending_interrupts: Arc<Mutex<HashMap<ConversationId, Vec<RequestId>>>>,
+    pending_interrupts: Arc<Mutex<HashMap<ConversationId, Vec<PendingInterrupt>>>>,
 ) {
     let Event { id: event_id, msg } = event;
     match msg {
@@ -1230,8 +1271,28 @@ async fn apply_bespoke_event_handling(
                 let response = InterruptConversationResponse {
                     abort_reason: turn_aborted_event.reason,
                 };
+                let structured = serde_json::to_value(&response).unwrap_or_else(|_| json!({}));
                 for rid in pending {
-                    outgoing.send_response(rid, response.clone()).await;
+                    match rid {
+                        PendingInterrupt::JsonRpc(rid) => {
+                            outgoing.send_response(rid, response.clone()).await;
+                        }
+                        PendingInterrupt::Tool(rid) => {
+                            let result = CallToolResult {
+                                content: vec![ContentBlock::TextContent(TextContent {
+                                    r#type: "text".to_string(),
+                                    text: format!(
+                                        "Conversation interrupted with reason: {:?}",
+                                        response.abort_reason
+                                    ),
+                                    annotations: None,
+                                })],
+                                is_error: None,
+                                structured_content: Some(structured.clone()),
+                            };
+                            outgoing.send_response(rid, result).await;
+                        }
+                    }
                 }
             }
         }
@@ -1409,7 +1470,7 @@ fn extract_conversation_summary(
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use serde_json::json;
+use serde_json::json;
 
     #[test]
     fn extract_conversation_summary_prefers_plain_user_messages() {

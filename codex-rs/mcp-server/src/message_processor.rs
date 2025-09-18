@@ -1,15 +1,31 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use uuid::Uuid;
 
+use crate::McpServerFeatureFlags;
+use crate::aux_agents::AuxAgentManager;
 use crate::codex_message_processor::CodexMessageProcessor;
+use crate::codex_message_processor::PendingInterrupt;
 use crate::codex_tool_config::CodexToolCallParam;
 use crate::codex_tool_config::CodexToolCallReplyParam;
-use crate::codex_tool_config::create_tool_for_codex_tool_call_param;
-use crate::codex_tool_config::create_tool_for_codex_tool_call_reply_param;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::outgoing_message::OutgoingMessageSender;
+use crate::tool_catalog;
+use codex_protocol::mcp_protocol::ArchiveConversationParams;
+use codex_protocol::mcp_protocol::CancelLoginChatGptParams;
 use codex_protocol::mcp_protocol::ClientRequest;
 use codex_protocol::mcp_protocol::ConversationId;
+use codex_protocol::mcp_protocol::ExecOneOffCommandParams;
+use codex_protocol::mcp_protocol::GetAuthStatusParams;
+use codex_protocol::mcp_protocol::GitDiffToRemoteParams;
+use codex_protocol::mcp_protocol::InterruptConversationParams;
+use codex_protocol::mcp_protocol::ListConversationsParams;
+use codex_protocol::mcp_protocol::LoginApiKeyParams;
+use codex_protocol::mcp_protocol::NewConversationParams;
+use codex_protocol::mcp_protocol::ResumeConversationParams;
+use codex_protocol::mcp_protocol::SendUserMessageParams;
+use codex_protocol::mcp_protocol::SendUserTurnParams;
+use codex_protocol::mcp_protocol::SetDefaultModelParams;
 
 use codex_core::AuthManager;
 use codex_core::ConversationManager;
@@ -32,6 +48,9 @@ use mcp_types::RequestId;
 use mcp_types::ServerCapabilitiesTools;
 use mcp_types::ServerNotification;
 use mcp_types::TextContent;
+use serde::Deserialize;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -44,25 +63,133 @@ pub(crate) struct MessageProcessor {
     codex_linux_sandbox_exe: Option<PathBuf>,
     conversation_manager: Arc<ConversationManager>,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ConversationId>>>,
+    feature_flags: McpServerFeatureFlags,
+    aux_agents: Option<AuxAgentManager>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SpawnAuxAgentParams {
+    prompt: String,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StopAuxAgentParams {
+    agent_id: Uuid,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ListAuxAgentsParams {}
+
 impl MessageProcessor {
+    fn tool_success_message(
+        message: impl Into<String>,
+        structured: Option<serde_json::Value>,
+    ) -> CallToolResult {
+        CallToolResult {
+            content: vec![ContentBlock::TextContent(TextContent {
+                r#type: "text".to_string(),
+                text: message.into(),
+                annotations: None,
+            })],
+            is_error: None,
+            structured_content: structured,
+        }
+    }
+
+    fn tool_success_from_value(
+        message: impl Into<String>,
+        value: impl Serialize,
+    ) -> CallToolResult {
+        match serde_json::to_value(value) {
+            Ok(val) => Self::tool_success_message(message, Some(val)),
+            Err(err) => {
+                Self::tool_error_message(format!("failed to serialize tool response: {err}"))
+            }
+        }
+    }
+
+    fn tool_error_message(message: impl Into<String>) -> CallToolResult {
+        CallToolResult {
+            content: vec![ContentBlock::TextContent(TextContent {
+                r#type: "text".to_string(),
+                text: message.into(),
+                annotations: None,
+            })],
+            is_error: Some(true),
+            structured_content: None,
+        }
+    }
+
+    fn tool_error_from_rpc(error: JSONRPCErrorError) -> CallToolResult {
+        Self::tool_error_message(error.message)
+    }
+
+    fn parse_tool_arguments<T: DeserializeOwned>(
+        &self,
+        name: &str,
+        arguments: Option<serde_json::Value>,
+    ) -> Result<T, CallToolResult> {
+        arguments
+            .ok_or_else(|| Self::tool_error_message(format!("tool '{name}' requires arguments")))
+            .and_then(|value| {
+                serde_json::from_value(value).map_err(|err| {
+                    Self::tool_error_message(format!(
+                        "failed to parse arguments for tool '{name}': {err}"
+                    ))
+                })
+            })
+    }
+
+    fn parse_tool_arguments_or_empty<T: DeserializeOwned>(
+        &self,
+        name: &str,
+        arguments: Option<serde_json::Value>,
+    ) -> Result<T, CallToolResult> {
+        let value = arguments.unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+        serde_json::from_value(value).map_err(|err| {
+            Self::tool_error_message(format!(
+                "failed to parse arguments for tool '{name}': {err}"
+            ))
+        })
+    }
+
+    async fn send_tool_call_result(&self, id: &RequestId, result: CallToolResult) {
+        self.send_response::<mcp_types::CallToolRequest>(id.clone(), result)
+            .await;
+    }
+
     /// Create a new `MessageProcessor`, retaining a handle to the outgoing
     /// `Sender` so handlers can enqueue messages to be written to stdout.
     pub(crate) fn new(
         outgoing: OutgoingMessageSender,
         codex_linux_sandbox_exe: Option<PathBuf>,
         config: Arc<Config>,
+        feature_flags: McpServerFeatureFlags,
     ) -> Self {
         let outgoing = Arc::new(outgoing);
         let auth_manager = AuthManager::shared(config.codex_home.clone());
         let conversation_manager = Arc::new(ConversationManager::new(auth_manager.clone()));
+        let aux_agents = feature_flags.max_aux_agents.and_then(|limit| {
+            if limit == 0 {
+                return None;
+            }
+            let exe = std::env::current_exe().ok()?;
+            Some(AuxAgentManager::new(
+                limit,
+                exe,
+                config.cwd.clone(),
+                outgoing.clone(),
+            ))
+        });
         let codex_message_processor = CodexMessageProcessor::new(
             auth_manager,
             conversation_manager.clone(),
             outgoing.clone(),
             codex_linux_sandbox_exe.clone(),
-            config,
+            config.clone(),
+            feature_flags.clone(),
         );
         Self {
             codex_message_processor,
@@ -71,6 +198,8 @@ impl MessageProcessor {
             codex_linux_sandbox_exe,
             conversation_manager,
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
+            feature_flags,
+            aux_agents,
         }
     }
 
@@ -319,10 +448,7 @@ impl MessageProcessor {
     ) {
         tracing::trace!("tools/list -> {params:?}");
         let result = ListToolsResult {
-            tools: vec![
-                create_tool_for_codex_tool_call_param(),
-                create_tool_for_codex_tool_call_reply_param(),
-            ],
+            tools: tool_catalog::list_tools(&self.feature_flags),
             next_cursor: None,
         };
 
@@ -344,6 +470,9 @@ impl MessageProcessor {
                 self.handle_tool_call_codex_session_reply(id, arguments)
                     .await
             }
+            _ if self.feature_flags.expose_all_tools => {
+                self.handle_extended_tool_call(name, id, arguments).await;
+            }
             _ => {
                 let result = CallToolResult {
                     content: vec![ContentBlock::TextContent(TextContent {
@@ -356,6 +485,521 @@ impl MessageProcessor {
                 };
                 self.send_response::<mcp_types::CallToolRequest>(id, result)
                     .await;
+            }
+        }
+    }
+
+    async fn handle_extended_tool_call(
+        &self,
+        name: String,
+        id: RequestId,
+        arguments: Option<serde_json::Value>,
+    ) {
+        match name.as_str() {
+            "codex.newConversation" => {
+                let params = match self
+                    .parse_tool_arguments::<NewConversationParams>(&name, arguments.clone())
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, err).await;
+                        return;
+                    }
+                };
+
+                match self
+                    .codex_message_processor
+                    .new_conversation_internal(params)
+                    .await
+                {
+                    Ok(response) => {
+                        let result = Self::tool_success_from_value(
+                            "Started new Codex conversation",
+                            &response,
+                        );
+                        self.send_tool_call_result(&id, result).await;
+                    }
+                    Err(err) => {
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await;
+                    }
+                }
+            }
+            "codex.listConversations" => {
+                let params = if let Some(value) = arguments.clone() {
+                    match serde_json::from_value::<ListConversationsParams>(value) {
+                        Ok(p) => p,
+                        Err(err) => {
+                            self.send_tool_call_result(
+                                &id,
+                                Self::tool_error_message(format!(
+                                    "failed to parse arguments for tool '{name}': {err}"
+                                )),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                } else {
+                    ListConversationsParams::default()
+                };
+
+                match self
+                    .codex_message_processor
+                    .list_conversations_internal(params)
+                    .await
+                {
+                    Ok(response) => {
+                        let result =
+                            Self::tool_success_from_value("Listed Codex conversations", &response);
+                        self.send_tool_call_result(&id, result).await;
+                    }
+                    Err(err) => {
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await;
+                    }
+                }
+            }
+            "codex.resumeConversation" => {
+                let params = match self
+                    .parse_tool_arguments::<ResumeConversationParams>(&name, arguments.clone())
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, err).await;
+                        return;
+                    }
+                };
+
+                match self
+                    .codex_message_processor
+                    .resume_conversation_internal(params)
+                    .await
+                {
+                    Ok((event, response)) => {
+                        if let Some(event) = event {
+                            self.outgoing.send_event_as_notification(&event, None).await;
+                        }
+                        let result =
+                            Self::tool_success_from_value("Resumed Codex conversation", &response);
+                        self.send_tool_call_result(&id, result).await;
+                    }
+                    Err(err) => {
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await;
+                    }
+                }
+            }
+            "codex.archiveConversation" => {
+                let params = match self
+                    .parse_tool_arguments::<ArchiveConversationParams>(&name, arguments.clone())
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, err).await;
+                        return;
+                    }
+                };
+
+                match self
+                    .codex_message_processor
+                    .archive_conversation_internal(params)
+                    .await
+                {
+                    Ok(response) => {
+                        let result =
+                            Self::tool_success_from_value("Archived Codex conversation", &response);
+                        self.send_tool_call_result(&id, result).await;
+                    }
+                    Err(err) => {
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await;
+                    }
+                }
+            }
+            "codex.sendUserMessage" => {
+                let params = match self
+                    .parse_tool_arguments::<SendUserMessageParams>(&name, arguments.clone())
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, err).await;
+                        return;
+                    }
+                };
+
+                match self
+                    .codex_message_processor
+                    .send_user_message_internal(params)
+                    .await
+                {
+                    Ok(response) => {
+                        let result = Self::tool_success_from_value(
+                            "Delivered user message to Codex conversation",
+                            &response,
+                        );
+                        self.send_tool_call_result(&id, result).await;
+                    }
+                    Err(err) => {
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await;
+                    }
+                }
+            }
+            "codex.sendUserTurn" => {
+                let params = match self
+                    .parse_tool_arguments::<SendUserTurnParams>(&name, arguments.clone())
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, err).await;
+                        return;
+                    }
+                };
+
+                match self
+                    .codex_message_processor
+                    .send_user_turn_internal(params)
+                    .await
+                {
+                    Ok(response) => {
+                        let result = Self::tool_success_from_value(
+                            "Submitted user turn to Codex conversation",
+                            &response,
+                        );
+                        self.send_tool_call_result(&id, result).await;
+                    }
+                    Err(err) => {
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await;
+                    }
+                }
+            }
+            "codex.interruptConversation" => {
+                let params = match self
+                    .parse_tool_arguments::<InterruptConversationParams>(&name, arguments.clone())
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, err).await;
+                        return;
+                    }
+                };
+
+                if let Err(err) = self
+                    .codex_message_processor
+                    .schedule_interrupt(params.conversation_id, PendingInterrupt::Tool(id.clone()))
+                    .await
+                {
+                    self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await;
+                }
+                // Response will be sent when TurnAborted arrives.
+            }
+            "codex.gitDiffToRemote" => {
+                let params = match self
+                    .parse_tool_arguments::<GitDiffToRemoteParams>(&name, arguments.clone())
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, err).await;
+                        return;
+                    }
+                };
+
+                match self
+                    .codex_message_processor
+                    .git_diff_to_origin_internal(params.cwd)
+                    .await
+                {
+                    Ok(response) => {
+                        let result =
+                            Self::tool_success_from_value("Computed git diff to remote", &response);
+                        self.send_tool_call_result(&id, result).await;
+                    }
+                    Err(err) => {
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await;
+                    }
+                }
+            }
+            "codex.loginApiKey" => {
+                let params = match self
+                    .parse_tool_arguments::<LoginApiKeyParams>(&name, arguments.clone())
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, err).await;
+                        return;
+                    }
+                };
+
+                match self
+                    .codex_message_processor
+                    .login_api_key_internal(params)
+                    .await
+                {
+                    Ok(response) => {
+                        let result = Self::tool_success_from_value("Stored API key", &response);
+                        self.send_tool_call_result(&id, result).await;
+                    }
+                    Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                }
+            }
+            "codex.loginChatGpt" => {
+                match self.codex_message_processor.login_chatgpt_internal().await {
+                    Ok(response) => {
+                        let result =
+                            Self::tool_success_from_value("Initiated ChatGPT login", &response);
+                        self.send_tool_call_result(&id, result).await;
+                    }
+                    Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                }
+            }
+            "codex.cancelLoginChatGpt" => {
+                let params = match self
+                    .parse_tool_arguments::<CancelLoginChatGptParams>(&name, arguments.clone())
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, err).await;
+                        return;
+                    }
+                };
+
+                match self
+                    .codex_message_processor
+                    .cancel_login_chatgpt_internal(params.login_id)
+                    .await
+                {
+                    Ok(response) => {
+                        let result =
+                            Self::tool_success_from_value("Cancelled ChatGPT login", &response);
+                        self.send_tool_call_result(&id, result).await;
+                    }
+                    Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                }
+            }
+            "codex.logoutChatGpt" => {
+                match self.codex_message_processor.logout_chatgpt_internal().await {
+                    Ok(response) => {
+                        let result = Self::tool_success_from_value("Logged out ChatGPT", &response);
+                        self.send_tool_call_result(&id, result).await;
+                    }
+                    Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                }
+            }
+            "codex.getAuthStatus" => {
+                let params = match self
+                    .parse_tool_arguments_or_empty::<GetAuthStatusParams>(&name, arguments.clone())
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, err).await;
+                        return;
+                    }
+                };
+
+                match self
+                    .codex_message_processor
+                    .get_auth_status_internal(params)
+                    .await
+                {
+                    Ok(response) => {
+                        let result =
+                            Self::tool_success_from_value("Fetched auth status", &response);
+                        self.send_tool_call_result(&id, result).await;
+                    }
+                    Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                }
+            }
+            "codex.getUserSavedConfig" => {
+                match self
+                    .codex_message_processor
+                    .get_user_saved_config_internal()
+                    .await
+                {
+                    Ok(response) => {
+                        let result =
+                            Self::tool_success_from_value("Fetched saved config", &response);
+                        self.send_tool_call_result(&id, result).await;
+                    }
+                    Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                }
+            }
+            "codex.setDefaultModel" => {
+                let params = match self
+                    .parse_tool_arguments::<SetDefaultModelParams>(&name, arguments.clone())
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, err).await;
+                        return;
+                    }
+                };
+
+                match self
+                    .codex_message_processor
+                    .set_default_model_internal(params)
+                    .await
+                {
+                    Ok(response) => {
+                        let result =
+                            Self::tool_success_from_value("Updated default model", &response);
+                        self.send_tool_call_result(&id, result).await;
+                    }
+                    Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                }
+            }
+            "codex.getUserAgent" => match self.codex_message_processor.get_user_agent_internal() {
+                Ok(response) => {
+                    let result =
+                        Self::tool_success_from_value("Fetched Codex user agent", &response);
+                    self.send_tool_call_result(&id, result).await;
+                }
+                Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+            },
+            "codex.userInfo" => match self.codex_message_processor.get_user_info_internal().await {
+                Ok(response) => {
+                    let result = Self::tool_success_from_value("Fetched user info", &response);
+                    self.send_tool_call_result(&id, result).await;
+                }
+                Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+            },
+            "codex.execCommand" => {
+                let params = match self
+                    .parse_tool_arguments::<ExecOneOffCommandParams>(&name, arguments.clone())
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, err).await;
+                        return;
+                    }
+                };
+
+                match self
+                    .codex_message_processor
+                    .exec_one_off_command_internal(params)
+                    .await
+                {
+                    Ok(response) => {
+                        let result = Self::tool_success_from_value("Executed command", &response);
+                        self.send_tool_call_result(&id, result).await;
+                    }
+                    Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                }
+            }
+            "codex.spawnAuxAgent" => {
+                let manager = match &self.aux_agents {
+                    Some(mgr) => mgr.clone(),
+                    None => {
+                        self.send_tool_call_result(
+                            &id,
+                            Self::tool_error_message(
+                                "auxiliary agents are disabled for this server",
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                let params = match self
+                    .parse_tool_arguments::<SpawnAuxAgentParams>(&name, arguments.clone())
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, err).await;
+                        return;
+                    }
+                };
+
+                match manager.spawn_agent(params.prompt, params.cwd).await {
+                    Ok(result) => {
+                        let result =
+                            Self::tool_success_from_value("Spawned auxiliary agent", &result);
+                        self.send_tool_call_result(&id, result).await;
+                    }
+                    Err(err) => {
+                        self.send_tool_call_result(
+                            &id,
+                            Self::tool_error_message(format!(
+                                "failed to spawn auxiliary agent: {err}"
+                            )),
+                        )
+                        .await;
+                    }
+                }
+            }
+            "codex.stopAuxAgent" => {
+                let manager = match &self.aux_agents {
+                    Some(mgr) => mgr.clone(),
+                    None => {
+                        self.send_tool_call_result(
+                            &id,
+                            Self::tool_error_message(
+                                "auxiliary agents are disabled for this server",
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                let params = match self
+                    .parse_tool_arguments::<StopAuxAgentParams>(&name, arguments.clone())
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, err).await;
+                        return;
+                    }
+                };
+
+                match manager.stop_agent(params.agent_id).await {
+                    Ok(()) => {
+                        self.send_tool_call_result(
+                            &id,
+                            Self::tool_success_message(
+                                format!("Stopped auxiliary agent {}", params.agent_id),
+                                None,
+                            ),
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        self.send_tool_call_result(
+                            &id,
+                            Self::tool_error_message(format!(
+                                "failed to stop auxiliary agent: {err}"
+                            )),
+                        )
+                        .await;
+                    }
+                }
+            }
+            "codex.listAuxAgents" => {
+                let manager = match &self.aux_agents {
+                    Some(mgr) => mgr.clone(),
+                    None => {
+                        self.send_tool_call_result(
+                            &id,
+                            Self::tool_error_message(
+                                "auxiliary agents are disabled for this server",
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                let _params: ListAuxAgentsParams =
+                    match self.parse_tool_arguments_or_empty(&name, arguments.clone()) {
+                        Ok(p) => p,
+                        Err(err) => {
+                            self.send_tool_call_result(&id, err).await;
+                            return;
+                        }
+                    };
+
+                let agents = manager.list_agents().await;
+                let result = Self::tool_success_from_value("Listed auxiliary agents", &agents);
+                self.send_tool_call_result(&id, result).await;
+            }
+            _ => {
+                let result = Self::tool_error_message(format!(
+                    "Tool '{name}' is not yet implemented in the extended Codex surface"
+                ));
+                self.send_tool_call_result(&id, result).await;
             }
         }
     }

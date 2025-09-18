@@ -34,7 +34,7 @@ pub struct McpCli {
 #[derive(Debug, clap::Subcommand)]
 pub enum McpSubcommand {
     /// [experimental] Run the Codex MCP server (stdio transport).
-    Serve,
+    Serve(ServeArgs),
 
     /// [experimental] List configured MCP servers.
     List(ListArgs),
@@ -47,6 +47,17 @@ pub enum McpSubcommand {
 
     /// [experimental] Remove a global MCP server entry.
     Remove(RemoveArgs),
+}
+
+#[derive(Debug, clap::Parser, Default, Clone)]
+pub struct ServeArgs {
+    /// Expose the complete Codex action surface as individually addressable MCP tools.
+    #[arg(long)]
+    pub expose_all_tools: bool,
+
+    /// Maximum number of auxiliary Codex agents the server may orchestrate concurrently.
+    #[arg(long, value_name = "N")]
+    pub max_aux_agents: Option<usize>,
 }
 
 #[derive(Debug, clap::Parser)]
@@ -92,11 +103,18 @@ impl McpCli {
             config_overrides,
             cmd,
         } = self;
-        let subcommand = cmd.unwrap_or(McpSubcommand::Serve);
+        let subcommand = cmd.unwrap_or(McpSubcommand::Serve(ServeArgs::default()));
 
         match subcommand {
-            McpSubcommand::Serve => {
-                codex_mcp_server::run_main(codex_linux_sandbox_exe, config_overrides).await?;
+            McpSubcommand::Serve(args) => {
+                let run_options = codex_mcp_server::McpServerRunOptions {
+                    cli_config_overrides: config_overrides.clone(),
+                    feature_flags: codex_mcp_server::McpServerFeatureFlags {
+                        expose_all_tools: args.expose_all_tools,
+                        max_aux_agents: args.max_aux_agents,
+                    },
+                };
+                codex_mcp_server::run_main(codex_linux_sandbox_exe, run_options).await?;
             }
             McpSubcommand::List(args) => {
                 run_list(&config_overrides, args)?;

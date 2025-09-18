@@ -20,6 +20,7 @@ use tracing::error;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod aux_agents;
 mod codex_message_processor;
 mod codex_tool_config;
 mod codex_tool_runner;
@@ -29,6 +30,7 @@ mod json_to_toml;
 pub(crate) mod message_processor;
 mod outgoing_message;
 mod patch_approval;
+mod tool_catalog;
 
 use crate::message_processor::MessageProcessor;
 use crate::outgoing_message::OutgoingMessage;
@@ -46,9 +48,38 @@ pub use crate::patch_approval::PatchApprovalResponse;
 /// plenty for an interactive CLI.
 const CHANNEL_CAPACITY: usize = 128;
 
+/// Feature toggles that shape how the embedded MCP server behaves at runtime.
+#[derive(Clone, Debug, Default)]
+pub struct McpServerFeatureFlags {
+    /// When true, expose the full Codex action surface as MCP tools. When false,
+    /// the server only advertises the legacy `codex`/`codex-reply` tools that
+    /// were previously available.
+    pub expose_all_tools: bool,
+
+    /// Optional ceiling for concurrently spawned auxiliary agents. `None`
+    /// retains the existing behaviour (no auxiliary orchestration).
+    pub max_aux_agents: Option<usize>,
+}
+
+/// Options passed to [`run_main`] when starting the MCP server.
+#[derive(Clone, Debug)]
+pub struct McpServerRunOptions {
+    pub cli_config_overrides: CliConfigOverrides,
+    pub feature_flags: McpServerFeatureFlags,
+}
+
+impl Default for McpServerRunOptions {
+    fn default() -> Self {
+        Self {
+            cli_config_overrides: CliConfigOverrides::default(),
+            feature_flags: McpServerFeatureFlags::default(),
+        }
+    }
+}
+
 pub async fn run_main(
     codex_linux_sandbox_exe: Option<PathBuf>,
-    cli_config_overrides: CliConfigOverrides,
+    options: McpServerRunOptions,
 ) -> IoResult<()> {
     // Install a simple subscriber so `tracing` output is visible.  Users can
     // control the log level with `RUST_LOG`.
@@ -86,12 +117,15 @@ pub async fn run_main(
 
     // Parse CLI overrides once and derive the base Config eagerly so later
     // components do not need to work with raw TOML values.
-    let cli_kv_overrides = cli_config_overrides.parse_overrides().map_err(|e| {
-        std::io::Error::new(
-            ErrorKind::InvalidInput,
-            format!("error parsing -c overrides: {e}"),
-        )
-    })?;
+    let cli_kv_overrides = options
+        .cli_config_overrides
+        .parse_overrides()
+        .map_err(|e| {
+            std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("error parsing -c overrides: {e}"),
+            )
+        })?;
     let config = Config::load_with_cli_overrides(cli_kv_overrides, ConfigOverrides::default())
         .map_err(|e| {
             std::io::Error::new(ErrorKind::InvalidData, format!("error loading config: {e}"))
@@ -104,6 +138,7 @@ pub async fn run_main(
             outgoing_message_sender,
             codex_linux_sandbox_exe,
             std::sync::Arc::new(config),
+            options.feature_flags,
         );
         async move {
             while let Some(msg) = incoming_rx.recv().await {

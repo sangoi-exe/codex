@@ -118,3 +118,10 @@ Use the MCP inspector and `codex mcp` to build a simple tic-tac-toe game with th
 **sandbox:** workspace-write
 
 Click "Run Tool" and you should see a list of events emitted from the Codex MCP server as it builds the game.
+
+## Embedded MCP server
+
+- Run `codex mcp serve --expose-all-tools` to expose the full Codex action set (conversation lifecycle, auth management, git helpers, etc.) to MCP clients like ChatGPT Developer Mode.
+- Add `--max-aux-agents=N` to enable orchestration of up to _N_ auxiliary Codex CLI subprocesses via the `codex.spawnAuxAgent`, `codex.listAuxAgents`, and `codex.stopAuxAgent` tools.
+- Without `--expose-all-tools` the server retains the legacy `codex`/`codex-reply` surface for backward compatibility.
+- Auxiliary agents stream output through `codex/aux-agent/output` notifications and emit a `codex/aux-agent/exit` notification when they terminate.
