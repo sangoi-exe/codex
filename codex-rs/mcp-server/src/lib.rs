@@ -1,11 +1,11 @@
 //! Prototype MCP server.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use std::path::PathBuf;
 
-use codex_common::CliConfigOverrides;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 
@@ -15,6 +15,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::io::{self};
 use tokio::sync::mpsc;
+use toml::Value;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -48,31 +49,38 @@ pub use crate::patch_approval::PatchApprovalResponse;
 /// plenty for an interactive CLI.
 const CHANNEL_CAPACITY: usize = 128;
 
-/// Feature toggles that shape how the embedded MCP server behaves at runtime.
+/// Options that shape how the MCP server behaves for a single invocation.
 #[derive(Clone, Debug, Default)]
-pub struct McpServerFeatureFlags {
+pub struct McpServerOpts {
     /// When true, expose the full Codex action surface as MCP tools. When false,
-    /// the server only advertises the legacy `codex`/`codex-reply` tools that
-    /// were previously available.
+    /// only the lightweight `reply` tool (and any explicitly enabled tools)
+    /// will be advertised.
     pub expose_all_tools: bool,
 
-    /// Optional ceiling for concurrently spawned auxiliary agents. `None`
-    /// retains the existing behaviour (no auxiliary orchestration).
-    pub max_aux_agents: Option<usize>,
+    /// Enables the experimental `foo` tool used internally for smoke testing.
+    pub enable_foo: bool,
+
+    /// Simplistic `key=value` overrides captured from the CLI. Values are
+    /// stored exactly as provided without attempting additional parsing.
+    pub overrides: HashMap<String, String>,
 }
 
 /// Options passed to [`run_main`] when starting the MCP server.
 #[derive(Clone, Debug)]
 pub struct McpServerRunOptions {
-    pub cli_config_overrides: CliConfigOverrides,
-    pub feature_flags: McpServerFeatureFlags,
+    pub opts: McpServerOpts,
+    pub max_aux_agents: Option<usize>,
 }
 
 impl Default for McpServerRunOptions {
     fn default() -> Self {
         Self {
-            cli_config_overrides: CliConfigOverrides::default(),
-            feature_flags: McpServerFeatureFlags::default(),
+            opts: McpServerOpts {
+                expose_all_tools: true,
+                enable_foo: false,
+                overrides: HashMap::new(),
+            },
+            max_aux_agents: None,
         }
     }
 }
@@ -117,15 +125,14 @@ pub async fn run_main(
 
     // Parse CLI overrides once and derive the base Config eagerly so later
     // components do not need to work with raw TOML values.
-    let cli_kv_overrides = options
-        .cli_config_overrides
-        .parse_overrides()
-        .map_err(|e| {
-            std::io::Error::new(
-                ErrorKind::InvalidInput,
-                format!("error parsing -c overrides: {e}"),
-            )
-        })?;
+    let mut cli_kv_overrides: Vec<(String, Value)> = options
+        .opts
+        .overrides
+        .iter()
+        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .collect();
+    cli_kv_overrides.sort_by(|a, b| a.0.cmp(&b.0));
+
     let config = Config::load_with_cli_overrides(cli_kv_overrides, ConfigOverrides::default())
         .map_err(|e| {
             std::io::Error::new(ErrorKind::InvalidData, format!("error loading config: {e}"))
@@ -138,7 +145,8 @@ pub async fn run_main(
             outgoing_message_sender,
             codex_linux_sandbox_exe,
             std::sync::Arc::new(config),
-            options.feature_flags,
+            options.opts.clone(),
+            options.max_aux_agents,
         );
         async move {
             while let Some(msg) = incoming_rx.recv().await {

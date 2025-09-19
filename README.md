@@ -65,6 +65,39 @@ You can also use Codex with an API key, but this requires [additional setup](./d
 
 Codex CLI supports [MCP servers](./docs/advanced.md#model-context-protocol-mcp). Enable by adding an `mcp_servers` section to your `~/.codex/config.toml`.
 
+#### MCP mode
+
+Model Context Protocol support lets you expose Codex as a server or consume other MCP endpoints. The official OpenAI Codex MCP guide, the Model Context Protocol Inspector README, and the OpenAI announcement on Codex + MCP outline the end-to-end workflow—follow them for the most current details.
+
+- Launch the Inspector UI against the Codex MCP server (UI listens on port `6274`, the local proxy on `6277`):
+
+  ```sh
+  npx @modelcontextprotocol/inspector codex mcp --expose-all-tools
+  ```
+
+- Use the Inspector CLI to inspect the exposed tools over stdio:
+
+  ```sh
+  npx @modelcontextprotocol/inspector --cli codex mcp --method tools/list
+  npx @modelcontextprotocol/inspector --cli codex mcp --method tools/call --tool-name reply --tool-arg prompt="hello"
+  ```
+
+- When the Inspector needs its own runtime flags, place `--` between Codex options and Inspector arguments so Clap stops parsing (`codex mcp -- --cli …`).
+
+- `codex mcp serve` accepts `--expose-all-tools` to surface the full Codex toolset and `--enable-foo` to expose the diagnostic `foo` tool. Logs are written to stderr so stdio remains protocol-clean.
+
+- Node.js 18 or newer is required for the Inspector packages.
+
+- To use Codex as an MCP **client**, add entries to `~/.codex/config.toml`:
+
+  ```toml
+  [mcp_servers.files]
+  command = "npx"
+  args = ["@modelcontextprotocol/server-filesystem", "/home/USER/Desktop"]
+  ```
+
+  Replace the path and command per the upstream server instructions. Codex will merge these servers with any overrides passed via `codex mcp` flags.
+
 
 ### Configuration
 
@@ -102,4 +135,3 @@ Codex CLI supports a rich set of configuration options, with preferences stored 
 ## License
 
 This repository is licensed under the [Apache-2.0 License](LICENSE).
-

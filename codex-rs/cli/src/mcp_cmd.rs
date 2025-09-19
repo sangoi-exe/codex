@@ -13,6 +13,7 @@ use codex_core::config::find_codex_home;
 use codex_core::config::load_global_mcp_servers;
 use codex_core::config::write_global_mcp_servers;
 use codex_core::config_types::McpServerConfig;
+use toml::Value;
 
 /// [experimental] Launch Codex as an MCP server or manage configured MCP servers.
 ///
@@ -50,14 +51,30 @@ pub enum McpSubcommand {
 }
 
 #[derive(Debug, clap::Parser, Default, Clone)]
+#[command(
+    after_help = "Runtime parameters belong to tool inputs via MCP; do not pass them as CLI flags."
+)]
 pub struct ServeArgs {
     /// Expose the complete Codex action surface as individually addressable MCP tools.
     #[arg(long)]
     pub expose_all_tools: bool,
 
+    /// Enable the experimental `foo` tool for smoke testing scenarios.
+    #[arg(long)]
+    pub enable_foo: bool,
+
     /// Maximum number of auxiliary Codex agents the server may orchestrate concurrently.
     #[arg(long, value_name = "N")]
     pub max_aux_agents: Option<usize>,
+
+    /// Arguments after `--` are accepted for compatibility with MCP Inspector but ignored.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        num_args = 0..,
+        value_name = "INSPECTOR_ARGS"
+    )]
+    pub passthrough: Vec<String>,
 }
 
 #[derive(Debug, clap::Parser)]
@@ -107,12 +124,22 @@ impl McpCli {
 
         match subcommand {
             McpSubcommand::Serve(args) => {
+                let ServeArgs {
+                    expose_all_tools,
+                    enable_foo,
+                    max_aux_agents,
+                    ..
+                } = args;
+
+                let override_map = parse_plain_overrides(&config_overrides)?;
+
                 let run_options = codex_mcp_server::McpServerRunOptions {
-                    cli_config_overrides: config_overrides.clone(),
-                    feature_flags: codex_mcp_server::McpServerFeatureFlags {
-                        expose_all_tools: args.expose_all_tools,
-                        max_aux_agents: args.max_aux_agents,
+                    opts: codex_mcp_server::McpServerOpts {
+                        expose_all_tools,
+                        enable_foo,
+                        overrides: override_map,
                     },
+                    max_aux_agents,
                 };
                 codex_mcp_server::run_main(codex_linux_sandbox_exe, run_options).await?;
             }
@@ -135,8 +162,7 @@ impl McpCli {
 }
 
 fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Result<()> {
-    // Validate any provided overrides even though they are not currently applied.
-    config_overrides.parse_overrides().map_err(|e| anyhow!(e))?;
+    ensure_plain_overrides(config_overrides)?;
 
     let AddArgs { name, env, command } = add_args;
 
@@ -180,7 +206,7 @@ fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Result<(
 }
 
 fn run_remove(config_overrides: &CliConfigOverrides, remove_args: RemoveArgs) -> Result<()> {
-    config_overrides.parse_overrides().map_err(|e| anyhow!(e))?;
+    ensure_plain_overrides(config_overrides)?;
 
     let RemoveArgs { name } = remove_args;
 
@@ -207,7 +233,7 @@ fn run_remove(config_overrides: &CliConfigOverrides, remove_args: RemoveArgs) ->
 }
 
 fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) -> Result<()> {
-    let overrides = config_overrides.parse_overrides().map_err(|e| anyhow!(e))?;
+    let overrides = plain_overrides_as_toml(config_overrides)?;
     let config = Config::load_with_cli_overrides(overrides, ConfigOverrides::default())
         .context("failed to load configuration")?;
 
@@ -304,7 +330,7 @@ fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) -> Resul
 }
 
 fn run_get(config_overrides: &CliConfigOverrides, get_args: GetArgs) -> Result<()> {
-    let overrides = config_overrides.parse_overrides().map_err(|e| anyhow!(e))?;
+    let overrides = plain_overrides_as_toml(config_overrides)?;
     let config = Config::load_with_cli_overrides(overrides, ConfigOverrides::default())
         .context("failed to load configuration")?;
 
@@ -359,6 +385,47 @@ fn run_get(config_overrides: &CliConfigOverrides, get_args: GetArgs) -> Result<(
     Ok(())
 }
 
+fn parse_plain_overrides(overrides: &CliConfigOverrides) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    for raw in &overrides.raw_overrides {
+        let mut parts = raw.splitn(2, '=');
+        let key = parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow!(format!(
+                    "invalid config override '{raw}': expected key=value"
+                ))
+            })?;
+        let value = parts
+            .next()
+            .ok_or_else(|| {
+                anyhow!(format!(
+                    "invalid config override '{raw}': expected key=value"
+                ))
+            })?
+            .to_string();
+
+        map.insert(key.to_string(), value);
+    }
+
+    Ok(map)
+}
+
+fn ensure_plain_overrides(overrides: &CliConfigOverrides) -> Result<()> {
+    parse_plain_overrides(overrides).map(|_| ())
+}
+
+fn plain_overrides_as_toml(overrides: &CliConfigOverrides) -> Result<Vec<(String, Value)>> {
+    let mut entries: Vec<(String, Value)> = parse_plain_overrides(overrides)?
+        .into_iter()
+        .map(|(key, value)| (key, Value::String(value)))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(entries)
+}
+
 fn parse_env_pair(raw: &str) -> Result<(String, String), String> {
     let mut parts = raw.splitn(2, '=');
     let key = parts
@@ -384,5 +451,46 @@ fn validate_server_name(name: &str) -> Result<()> {
         Ok(())
     } else {
         bail!("invalid server name '{name}' (use letters, numbers, '-', '_')");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    fn overrides_from(raw: &[&str]) -> CliConfigOverrides {
+        CliConfigOverrides {
+            raw_overrides: raw.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn parse_plain_overrides_handles_basic_pairs() {
+        let overrides = overrides_from(&["model=o3", "foo.bar=baz"]);
+        let map = parse_plain_overrides(&overrides).expect("parse overrides");
+
+        assert_eq!(map.get("model"), Some(&"o3".to_string()));
+        assert_eq!(map.get("foo.bar"), Some(&"baz".to_string()));
+    }
+
+    #[test]
+    fn parse_plain_overrides_rejects_missing_equals() {
+        let overrides = overrides_from(&["missing"]);
+        let err = parse_plain_overrides(&overrides).expect_err("should fail");
+        assert!(err.to_string().contains("expected key=value"));
+    }
+
+    #[test]
+    fn plain_overrides_are_sorted_and_stringified() {
+        let overrides = overrides_from(&["beta=1", "alpha=two"]);
+        let entries = plain_overrides_as_toml(&overrides).expect("convert overrides");
+        assert_eq!(
+            entries,
+            vec![
+                ("alpha".to_string(), Value::String("two".to_string())),
+                ("beta".to_string(), Value::String("1".to_string())),
+            ]
+        );
     }
 }

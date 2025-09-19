@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-use crate::McpServerFeatureFlags;
+use crate::McpServerOpts;
 use crate::aux_agents::AuxAgentManager;
 use crate::codex_message_processor::CodexMessageProcessor;
 use crate::codex_message_processor::PendingInterrupt;
@@ -63,7 +63,8 @@ pub(crate) struct MessageProcessor {
     codex_linux_sandbox_exe: Option<PathBuf>,
     conversation_manager: Arc<ConversationManager>,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ConversationId>>>,
-    feature_flags: McpServerFeatureFlags,
+    server_opts: McpServerOpts,
+    max_aux_agents: Option<usize>,
     aux_agents: Option<AuxAgentManager>,
 }
 
@@ -81,6 +82,17 @@ struct StopAuxAgentParams {
 
 #[derive(Debug, Deserialize, Default)]
 struct ListAuxAgentsParams {}
+
+#[derive(Debug, Deserialize)]
+struct ReplyToolParams {
+    prompt: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FooToolParams {
+    #[serde(default)]
+    message: Option<String>,
+}
 
 impl MessageProcessor {
     fn tool_success_message(
@@ -126,6 +138,42 @@ impl MessageProcessor {
         Self::tool_error_message(error.message)
     }
 
+    async fn handle_reply_tool(&self, id: RequestId, arguments: Option<serde_json::Value>) {
+        let params = match self.parse_tool_arguments::<ReplyToolParams>("reply", arguments) {
+            Ok(value) => value,
+            Err(err) => {
+                self.send_tool_call_result(&id, err).await;
+                return;
+            }
+        };
+
+        let structured = json!({ "echo": params.prompt });
+        let result =
+            Self::tool_success_message(format!("Reply sent: {}", params.prompt), Some(structured));
+        self.send_tool_call_result(&id, result).await;
+    }
+
+    async fn handle_foo_tool(&self, id: RequestId, arguments: Option<serde_json::Value>) {
+        let params = match self.parse_tool_arguments_or_empty::<FooToolParams>("foo", arguments) {
+            Ok(value) => value,
+            Err(err) => {
+                self.send_tool_call_result(&id, err).await;
+                return;
+            }
+        };
+
+        let message = params
+            .message
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|msg| format!("foo: {msg}"))
+            .unwrap_or_else(|| "foo: ok".to_string());
+
+        let structured = json!({ "message": params.message });
+        let result = Self::tool_success_message(message, Some(structured));
+        self.send_tool_call_result(&id, result).await;
+    }
+
     fn parse_tool_arguments<T: DeserializeOwned>(
         &self,
         name: &str,
@@ -166,12 +214,13 @@ impl MessageProcessor {
         outgoing: OutgoingMessageSender,
         codex_linux_sandbox_exe: Option<PathBuf>,
         config: Arc<Config>,
-        feature_flags: McpServerFeatureFlags,
+        server_opts: McpServerOpts,
+        max_aux_agents: Option<usize>,
     ) -> Self {
         let outgoing = Arc::new(outgoing);
         let auth_manager = AuthManager::shared(config.codex_home.clone());
         let conversation_manager = Arc::new(ConversationManager::new(auth_manager.clone()));
-        let aux_agents = feature_flags.max_aux_agents.and_then(|limit| {
+        let aux_agents = max_aux_agents.and_then(|limit| {
             if limit == 0 {
                 return None;
             }
@@ -189,7 +238,7 @@ impl MessageProcessor {
             outgoing.clone(),
             codex_linux_sandbox_exe.clone(),
             config.clone(),
-            feature_flags.clone(),
+            server_opts.clone(),
         );
         Self {
             codex_message_processor,
@@ -198,7 +247,8 @@ impl MessageProcessor {
             codex_linux_sandbox_exe,
             conversation_manager,
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
-            feature_flags,
+            server_opts,
+            max_aux_agents,
             aux_agents,
         }
     }
@@ -447,13 +497,25 @@ impl MessageProcessor {
         params: <mcp_types::ListToolsRequest as mcp_types::ModelContextProtocolRequest>::Params,
     ) {
         tracing::trace!("tools/list -> {params:?}");
-        let result = ListToolsResult {
-            tools: tool_catalog::list_tools(&self.feature_flags),
-            next_cursor: None,
-        };
+        match tool_catalog::list_tools(&self.server_opts, self.max_aux_agents) {
+            Ok(tools) => {
+                let result = ListToolsResult {
+                    tools,
+                    next_cursor: None,
+                };
 
-        self.send_response::<mcp_types::ListToolsRequest>(id, result)
-            .await;
+                self.send_response::<mcp_types::ListToolsRequest>(id, result)
+                    .await;
+            }
+            Err(err) => {
+                let error = JSONRPCErrorError {
+                    code: INVALID_REQUEST_ERROR_CODE,
+                    message: err,
+                    data: None,
+                };
+                self.outgoing.send_error(id, error).await;
+            }
+        }
     }
 
     async fn handle_call_tool(
@@ -465,12 +527,26 @@ impl MessageProcessor {
         let CallToolRequestParams { name, arguments } = params;
 
         match name.as_str() {
-            "codex" => self.handle_tool_call_codex(id, arguments).await,
-            "codex-reply" => {
+            "reply" => {
+                self.handle_reply_tool(id, arguments).await;
+            }
+            "foo" if self.server_opts.enable_foo => {
+                self.handle_foo_tool(id, arguments).await;
+            }
+            "foo" => {
+                let result = Self::tool_error_message(
+                    "Tool 'foo' requires --enable-foo to be set when launching the server.",
+                );
+                self.send_tool_call_result(&id, result).await;
+            }
+            "codex" if self.server_opts.expose_all_tools => {
+                self.handle_tool_call_codex(id, arguments).await
+            }
+            "codex-reply" if self.server_opts.expose_all_tools => {
                 self.handle_tool_call_codex_session_reply(id, arguments)
                     .await
             }
-            _ if self.feature_flags.expose_all_tools => {
+            _ if self.server_opts.expose_all_tools => {
                 self.handle_extended_tool_call(name, id, arguments).await;
             }
             _ => {
@@ -520,7 +596,8 @@ impl MessageProcessor {
                         self.send_tool_call_result(&id, result).await;
                     }
                     Err(err) => {
-                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await;
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                            .await;
                     }
                 }
             }
@@ -554,7 +631,8 @@ impl MessageProcessor {
                         self.send_tool_call_result(&id, result).await;
                     }
                     Err(err) => {
-                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await;
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                            .await;
                     }
                 }
             }
@@ -583,7 +661,8 @@ impl MessageProcessor {
                         self.send_tool_call_result(&id, result).await;
                     }
                     Err(err) => {
-                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await;
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                            .await;
                     }
                 }
             }
@@ -609,7 +688,8 @@ impl MessageProcessor {
                         self.send_tool_call_result(&id, result).await;
                     }
                     Err(err) => {
-                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await;
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                            .await;
                     }
                 }
             }
@@ -637,7 +717,8 @@ impl MessageProcessor {
                         self.send_tool_call_result(&id, result).await;
                     }
                     Err(err) => {
-                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await;
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                            .await;
                     }
                 }
             }
@@ -665,7 +746,8 @@ impl MessageProcessor {
                         self.send_tool_call_result(&id, result).await;
                     }
                     Err(err) => {
-                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await;
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                            .await;
                     }
                 }
             }
@@ -685,7 +767,8 @@ impl MessageProcessor {
                     .schedule_interrupt(params.conversation_id, PendingInterrupt::Tool(id.clone()))
                     .await
                 {
-                    self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await;
+                    self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                        .await;
                 }
                 // Response will be sent when TurnAborted arrives.
             }
@@ -711,7 +794,8 @@ impl MessageProcessor {
                         self.send_tool_call_result(&id, result).await;
                     }
                     Err(err) => {
-                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await;
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                            .await;
                     }
                 }
             }
@@ -735,7 +819,10 @@ impl MessageProcessor {
                         let result = Self::tool_success_from_value("Stored API key", &response);
                         self.send_tool_call_result(&id, result).await;
                     }
-                    Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                            .await
+                    }
                 }
             }
             "codex.loginChatGpt" => {
@@ -745,7 +832,10 @@ impl MessageProcessor {
                             Self::tool_success_from_value("Initiated ChatGPT login", &response);
                         self.send_tool_call_result(&id, result).await;
                     }
-                    Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                            .await
+                    }
                 }
             }
             "codex.cancelLoginChatGpt" => {
@@ -769,7 +859,10 @@ impl MessageProcessor {
                             Self::tool_success_from_value("Cancelled ChatGPT login", &response);
                         self.send_tool_call_result(&id, result).await;
                     }
-                    Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                            .await
+                    }
                 }
             }
             "codex.logoutChatGpt" => {
@@ -778,7 +871,10 @@ impl MessageProcessor {
                         let result = Self::tool_success_from_value("Logged out ChatGPT", &response);
                         self.send_tool_call_result(&id, result).await;
                     }
-                    Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                            .await
+                    }
                 }
             }
             "codex.getAuthStatus" => {
@@ -802,7 +898,10 @@ impl MessageProcessor {
                             Self::tool_success_from_value("Fetched auth status", &response);
                         self.send_tool_call_result(&id, result).await;
                     }
-                    Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                            .await
+                    }
                 }
             }
             "codex.getUserSavedConfig" => {
@@ -816,7 +915,10 @@ impl MessageProcessor {
                             Self::tool_success_from_value("Fetched saved config", &response);
                         self.send_tool_call_result(&id, result).await;
                     }
-                    Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                            .await
+                    }
                 }
             }
             "codex.setDefaultModel" => {
@@ -840,7 +942,10 @@ impl MessageProcessor {
                             Self::tool_success_from_value("Updated default model", &response);
                         self.send_tool_call_result(&id, result).await;
                     }
-                    Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                            .await
+                    }
                 }
             }
             "codex.getUserAgent" => match self.codex_message_processor.get_user_agent_internal() {
@@ -849,14 +954,20 @@ impl MessageProcessor {
                         Self::tool_success_from_value("Fetched Codex user agent", &response);
                     self.send_tool_call_result(&id, result).await;
                 }
-                Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                Err(err) => {
+                    self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                        .await
+                }
             },
             "codex.userInfo" => match self.codex_message_processor.get_user_info_internal().await {
                 Ok(response) => {
                     let result = Self::tool_success_from_value("Fetched user info", &response);
                     self.send_tool_call_result(&id, result).await;
                 }
-                Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                Err(err) => {
+                    self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                        .await
+                }
             },
             "codex.execCommand" => {
                 let params = match self
@@ -878,7 +989,10 @@ impl MessageProcessor {
                         let result = Self::tool_success_from_value("Executed command", &response);
                         self.send_tool_call_result(&id, result).await;
                     }
-                    Err(err) => self.send_tool_call_result(&id, Self::tool_error_from_rpc(err)).await,
+                    Err(err) => {
+                        self.send_tool_call_result(&id, Self::tool_error_from_rpc(err))
+                            .await
+                    }
                 }
             }
             "codex.spawnAuxAgent" => {

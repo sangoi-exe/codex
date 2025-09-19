@@ -1,4 +1,4 @@
-use crate::McpServerFeatureFlags;
+use crate::McpServerOpts;
 use crate::error_code::INTERNAL_ERROR_CODE;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::json_to_toml::json_to_toml;
@@ -67,10 +67,10 @@ use codex_protocol::mcp_protocol::LoginChatGptCompleteNotification;
 use codex_protocol::mcp_protocol::LoginChatGptResponse;
 use codex_protocol::mcp_protocol::NewConversationParams;
 use codex_protocol::mcp_protocol::NewConversationResponse;
-use codex_protocol::mcp_protocol::ResumeConversationResponse;
 use codex_protocol::mcp_protocol::RemoveConversationListenerParams;
 use codex_protocol::mcp_protocol::RemoveConversationSubscriptionResponse;
 use codex_protocol::mcp_protocol::ResumeConversationParams;
+use codex_protocol::mcp_protocol::ResumeConversationResponse;
 use codex_protocol::mcp_protocol::SendUserMessageParams;
 use codex_protocol::mcp_protocol::SendUserMessageResponse;
 use codex_protocol::mcp_protocol::SendUserTurnParams;
@@ -86,9 +86,9 @@ use codex_protocol::protocol::InputMessageKind;
 use codex_protocol::protocol::USER_MESSAGE_BEGIN;
 use mcp_types::CallToolResult;
 use mcp_types::ContentBlock;
-use mcp_types::TextContent;
 use mcp_types::JSONRPCErrorError;
 use mcp_types::RequestId;
+use mcp_types::TextContent;
 use serde_json::json;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -134,7 +134,7 @@ pub(crate) struct CodexMessageProcessor {
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
     // Queue of pending interrupt requests per conversation. We reply when TurnAborted arrives.
     pending_interrupts: Arc<Mutex<HashMap<ConversationId, Vec<PendingInterrupt>>>>,
-    _feature_flags: McpServerFeatureFlags,
+    _server_opts: McpServerOpts,
 }
 
 impl CodexMessageProcessor {
@@ -144,7 +144,7 @@ impl CodexMessageProcessor {
         outgoing: Arc<OutgoingMessageSender>,
         codex_linux_sandbox_exe: Option<PathBuf>,
         config: Arc<Config>,
-        feature_flags: McpServerFeatureFlags,
+        server_opts: McpServerOpts,
     ) -> Self {
         Self {
             auth_manager,
@@ -155,7 +155,7 @@ impl CodexMessageProcessor {
             conversation_listeners: HashMap::new(),
             active_login: Arc::new(Mutex::new(None)),
             pending_interrupts: Arc::new(Mutex::new(HashMap::new())),
-            _feature_flags: feature_flags,
+            _server_opts: server_opts,
         }
     }
 
@@ -1470,7 +1470,7 @@ fn extract_conversation_summary(
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-use serde_json::json;
+    use serde_json::json;
 
     #[test]
     fn extract_conversation_summary_prefers_plain_user_messages() {
