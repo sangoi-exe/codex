@@ -65,10 +65,6 @@ pub struct ServeArgs {
     #[arg(long, global = true)]
     pub expose_all_tools: bool,
 
-    /// Enable the experimental `foo` tool for smoke testing scenarios.
-    #[arg(long, global = true)]
-    pub enable_foo: bool,
-
     /// Maximum number of auxiliary Codex agents the server may orchestrate concurrently.
     #[arg(long, value_name = "N", global = true)]
     pub max_aux_agents: Option<usize>,
@@ -415,17 +411,13 @@ async fn run_serve(
 
     let ServeArgs {
         expose_all_tools,
-        enable_foo,
         max_aux_agents,
     } = serve_flags;
 
     eprintln!(
-        "[mcp] expose_all_tools={} enable_foo={}",
-        expose_all_tools, enable_foo
+        "[mcp] expose_all_tools={expose_all_tools} max_aux_agents={:?}",
+        max_aux_agents
     );
-    if let Some(limit) = max_aux_agents {
-        eprintln!("[mcp] max_aux_agents={limit}");
-    }
     if !passthrough.is_empty() {
         eprintln!("[mcp] passthrough args ignored: {passthrough:?}");
     }
@@ -433,7 +425,6 @@ async fn run_serve(
     let run_options = codex_mcp_server::McpServerRunOptions {
         opts: codex_mcp_server::McpServerOpts {
             expose_all_tools,
-            enable_foo,
             overrides,
         },
         max_aux_agents,
@@ -452,7 +443,6 @@ fn finalize_serve_args(
         Some(sub_args) => (
             ServeArgs {
                 expose_all_tools: global.expose_all_tools || sub_args.flags.expose_all_tools,
-                enable_foo: global.enable_foo || sub_args.flags.enable_foo,
                 max_aux_agents: sub_args.flags.max_aux_agents.or(global.max_aux_agents),
             },
             sub_args.passthrough,
@@ -465,9 +455,6 @@ fn warn_ignored_serve_flags(args: &ServeArgs, passthrough: &[String], subcommand
     let mut ignored_flags = Vec::new();
     if args.expose_all_tools {
         ignored_flags.push("--expose-all-tools");
-    }
-    if args.enable_foo {
-        ignored_flags.push("--enable-foo");
     }
     if args.max_aux_agents.is_some() {
         ignored_flags.push("--max-aux-agents");
@@ -571,14 +558,13 @@ mod tests {
         let cli = McpCli::try_parse_from(["mcp", "--expose-all-tools"]).expect("parse");
         assert!(cli.cmd.is_none());
         assert!(cli.serve_args.expose_all_tools);
-        assert!(!cli.serve_args.enable_foo);
     }
 
     #[test]
     fn serve_subcommand_preserves_flags() {
-        let cli = McpCli::try_parse_from(["mcp", "serve", "--enable-foo"]).expect("parse");
+        let cli = McpCli::try_parse_from(["mcp", "serve", "--expose-all-tools"]).expect("parse");
         match cli.cmd {
-            Some(McpSubcommand::Serve(args)) => assert!(args.flags.enable_foo),
+            Some(McpSubcommand::Serve(args)) => assert!(args.flags.expose_all_tools),
             other => panic!("expected serve subcommand, got {other:?}"),
         }
     }
@@ -615,12 +601,11 @@ mod tests {
         global.expose_all_tools = true;
 
         let mut sub = ServeCommandArgs::default();
-        sub.flags.enable_foo = true;
+        sub.flags.expose_all_tools = true;
         sub.flags.max_aux_agents = Some(3);
 
         let (combined_flags, passthrough) = finalize_serve_args(global.clone(), Some(sub.clone()));
         assert!(combined_flags.expose_all_tools);
-        assert!(combined_flags.enable_foo);
         assert_eq!(combined_flags.max_aux_agents, Some(3));
         assert!(passthrough.is_empty());
 

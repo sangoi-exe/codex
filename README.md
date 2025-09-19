@@ -69,19 +69,19 @@ Codex CLI supports [MCP servers](./docs/advanced.md#model-context-protocol-mcp).
 
 Model Context Protocol support lets you expose Codex as a server or consume other MCP endpoints. The official OpenAI Codex MCP guide, the Model Context Protocol Inspector README, and the OpenAI announcement on Codex + MCP outline the end-to-end workflow—follow them for the most current details.
 
-- Launch the Inspector (UI on port `6274`, proxy on `6277`) or its CLI with the commands below:
+- Example invocations (Inspector UI listens on port `6274`, proxy on `6277`):
 
   ```sh
-  npx @modelcontextprotocol/inspector codex mcp --expose-all-tools
-  npx @modelcontextprotocol/inspector codex mcp serve --expose-all-tools
   npx @modelcontextprotocol/inspector --cli codex mcp --method tools/list
-  npx @modelcontextprotocol/inspector --cli codex mcp serve --method tools/list
-  npx @modelcontextprotocol/inspector --cli codex mcp --method tools/call --tool-name reply --tool-arg prompt="hello"
+  npx @modelcontextprotocol/inspector --cli codex mcp --expose-all-tools --method tools/list
+  npx @modelcontextprotocol/inspector -- codex mcp --expose-all-tools
   ```
 
 - When the Inspector needs its own runtime flags, place `--` between Codex options and Inspector arguments so Clap stops parsing (`codex mcp -- --cli …`).
 
-- `codex mcp serve` accepts `--expose-all-tools` to surface the full Codex toolset and `--enable-foo` to expose the diagnostic `foo` tool. Logs are written to stderr so stdio remains protocol-clean.
+- By default only the code-editing toolset is exposed; use `--expose-all-tools` for administrative and diagnostic tools. Logs are written to stderr so stdio remains protocol-clean.
+
+- When no subcommand is provided, `codex mcp` runs `serve` by default.
 
 - Node.js 18 or newer is required for the Inspector packages.
 

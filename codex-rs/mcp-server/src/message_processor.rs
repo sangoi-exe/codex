@@ -88,12 +88,6 @@ struct ReplyToolParams {
     prompt: String,
 }
 
-#[derive(Debug, Deserialize, Default)]
-struct FooToolParams {
-    #[serde(default)]
-    message: Option<String>,
-}
-
 impl MessageProcessor {
     fn tool_success_message(
         message: impl Into<String>,
@@ -150,27 +144,6 @@ impl MessageProcessor {
         let structured = json!({ "echo": params.prompt });
         let result =
             Self::tool_success_message(format!("Reply sent: {}", params.prompt), Some(structured));
-        self.send_tool_call_result(&id, result).await;
-    }
-
-    async fn handle_foo_tool(&self, id: RequestId, arguments: Option<serde_json::Value>) {
-        let params = match self.parse_tool_arguments_or_empty::<FooToolParams>("foo", arguments) {
-            Ok(value) => value,
-            Err(err) => {
-                self.send_tool_call_result(&id, err).await;
-                return;
-            }
-        };
-
-        let message = params
-            .message
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(|msg| format!("foo: {msg}"))
-            .unwrap_or_else(|| "foo: ok".to_string());
-
-        let structured = json!({ "message": params.message });
-        let result = Self::tool_success_message(message, Some(structured));
         self.send_tool_call_result(&id, result).await;
     }
 
@@ -530,21 +503,13 @@ impl MessageProcessor {
             "reply" => {
                 self.handle_reply_tool(id, arguments).await;
             }
-            "foo" if self.server_opts.enable_foo => {
-                self.handle_foo_tool(id, arguments).await;
-            }
-            "foo" => {
-                let result = Self::tool_error_message(
-                    "Tool 'foo' requires --enable-foo to be set when launching the server.",
-                );
-                self.send_tool_call_result(&id, result).await;
-            }
-            "codex" if self.server_opts.expose_all_tools => {
-                self.handle_tool_call_codex(id, arguments).await
-            }
-            "codex-reply" if self.server_opts.expose_all_tools => {
+            "codex" => self.handle_tool_call_codex(id, arguments).await,
+            "codex-reply" => {
                 self.handle_tool_call_codex_session_reply(id, arguments)
                     .await
+            }
+            other if crate::tool_catalog::is_code_editing_tool(other) => {
+                self.handle_extended_tool_call(name, id, arguments).await;
             }
             _ if self.server_opts.expose_all_tools => {
                 self.handle_extended_tool_call(name, id, arguments).await;
