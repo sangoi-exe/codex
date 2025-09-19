@@ -69,16 +69,13 @@ Codex CLI supports [MCP servers](./docs/advanced.md#model-context-protocol-mcp).
 
 Model Context Protocol support lets you expose Codex as a server or consume other MCP endpoints. The official OpenAI Codex MCP guide, the Model Context Protocol Inspector README, and the OpenAI announcement on Codex + MCP outline the end-to-end workflow—follow them for the most current details.
 
-- Launch the Inspector UI against the Codex MCP server (UI listens on port `6274`, the local proxy on `6277`):
+- Launch the Inspector (UI on port `6274`, proxy on `6277`) or its CLI with the commands below:
 
   ```sh
   npx @modelcontextprotocol/inspector codex mcp --expose-all-tools
-  ```
-
-- Use the Inspector CLI to inspect the exposed tools over stdio:
-
-  ```sh
+  npx @modelcontextprotocol/inspector codex mcp serve --expose-all-tools
   npx @modelcontextprotocol/inspector --cli codex mcp --method tools/list
+  npx @modelcontextprotocol/inspector --cli codex mcp serve --method tools/list
   npx @modelcontextprotocol/inspector --cli codex mcp --method tools/call --tool-name reply --tool-arg prompt="hello"
   ```
 

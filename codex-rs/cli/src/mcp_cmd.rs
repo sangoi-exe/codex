@@ -6,6 +6,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use clap::Args;
 use codex_common::CliConfigOverrides;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
@@ -24,9 +25,17 @@ use toml::Value;
 /// - `add`    — add a server launcher entry to `~/.codex/config.toml`
 /// - `remove` — delete a server entry
 #[derive(Debug, clap::Parser)]
+#[command(
+    after_help = "When no subcommand is provided, `codex mcp` runs `serve` by default.",
+    args_conflicts_with_subcommands = true,
+    subcommand_precedence_over_arg = true
+)]
 pub struct McpCli {
     #[clap(flatten)]
     pub config_overrides: CliConfigOverrides,
+
+    #[clap(flatten)]
+    pub serve_args: ServeArgs,
 
     #[command(subcommand)]
     pub cmd: Option<McpSubcommand>,
@@ -35,7 +44,7 @@ pub struct McpCli {
 #[derive(Debug, clap::Subcommand)]
 pub enum McpSubcommand {
     /// [experimental] Run the Codex MCP server (stdio transport).
-    Serve(ServeArgs),
+    Serve(ServeCommandArgs),
 
     /// [experimental] List configured MCP servers.
     List(ListArgs),
@@ -50,22 +59,28 @@ pub enum McpSubcommand {
     Remove(RemoveArgs),
 }
 
+#[derive(Debug, Args, Default, Clone)]
+pub struct ServeArgs {
+    /// Expose the complete Codex action surface as individually addressable MCP tools.
+    #[arg(long, global = true)]
+    pub expose_all_tools: bool,
+
+    /// Enable the experimental `foo` tool for smoke testing scenarios.
+    #[arg(long, global = true)]
+    pub enable_foo: bool,
+
+    /// Maximum number of auxiliary Codex agents the server may orchestrate concurrently.
+    #[arg(long, value_name = "N", global = true)]
+    pub max_aux_agents: Option<usize>,
+}
+
 #[derive(Debug, clap::Parser, Default, Clone)]
 #[command(
     after_help = "Runtime parameters belong to tool inputs via MCP; do not pass them as CLI flags."
 )]
-pub struct ServeArgs {
-    /// Expose the complete Codex action surface as individually addressable MCP tools.
-    #[arg(long)]
-    pub expose_all_tools: bool,
-
-    /// Enable the experimental `foo` tool for smoke testing scenarios.
-    #[arg(long)]
-    pub enable_foo: bool,
-
-    /// Maximum number of auxiliary Codex agents the server may orchestrate concurrently.
-    #[arg(long, value_name = "N")]
-    pub max_aux_agents: Option<usize>,
+pub struct ServeCommandArgs {
+    #[command(flatten)]
+    pub flags: ServeArgs,
 
     /// Arguments after `--` are accepted for compatibility with MCP Inspector but ignored.
     #[arg(
@@ -118,41 +133,46 @@ impl McpCli {
     pub async fn run(self, codex_linux_sandbox_exe: Option<PathBuf>) -> Result<()> {
         let McpCli {
             config_overrides,
+            serve_args,
             cmd,
         } = self;
-        let subcommand = cmd.unwrap_or(McpSubcommand::Serve(ServeArgs::default()));
 
-        match subcommand {
-            McpSubcommand::Serve(args) => {
-                let ServeArgs {
-                    expose_all_tools,
-                    enable_foo,
-                    max_aux_agents,
-                    ..
-                } = args;
-
-                let override_map = parse_plain_overrides(&config_overrides)?;
-
-                let run_options = codex_mcp_server::McpServerRunOptions {
-                    opts: codex_mcp_server::McpServerOpts {
-                        expose_all_tools,
-                        enable_foo,
-                        overrides: override_map,
-                    },
-                    max_aux_agents,
-                };
-                codex_mcp_server::run_main(codex_linux_sandbox_exe, run_options).await?;
+        match cmd {
+            None => {
+                let (effective_flags, passthrough) = finalize_serve_args(serve_args.clone(), None);
+                run_serve(
+                    &config_overrides,
+                    effective_flags,
+                    passthrough,
+                    codex_linux_sandbox_exe.clone(),
+                )
+                .await?;
             }
-            McpSubcommand::List(args) => {
+            Some(McpSubcommand::Serve(sub_args)) => {
+                let (effective_flags, passthrough) =
+                    finalize_serve_args(serve_args.clone(), Some(sub_args));
+                run_serve(
+                    &config_overrides,
+                    effective_flags,
+                    passthrough,
+                    codex_linux_sandbox_exe.clone(),
+                )
+                .await?;
+            }
+            Some(McpSubcommand::List(args)) => {
+                warn_ignored_serve_flags(&serve_args, &[], "list");
                 run_list(&config_overrides, args)?;
             }
-            McpSubcommand::Get(args) => {
+            Some(McpSubcommand::Get(args)) => {
+                warn_ignored_serve_flags(&serve_args, &[], "get");
                 run_get(&config_overrides, args)?;
             }
-            McpSubcommand::Add(args) => {
+            Some(McpSubcommand::Add(args)) => {
+                warn_ignored_serve_flags(&serve_args, &[], "add");
                 run_add(&config_overrides, args)?;
             }
-            McpSubcommand::Remove(args) => {
+            Some(McpSubcommand::Remove(args)) => {
+                warn_ignored_serve_flags(&serve_args, &[], "remove");
                 run_remove(&config_overrides, args)?;
             }
         }
@@ -385,6 +405,86 @@ fn run_get(config_overrides: &CliConfigOverrides, get_args: GetArgs) -> Result<(
     Ok(())
 }
 
+async fn run_serve(
+    config_overrides: &CliConfigOverrides,
+    serve_flags: ServeArgs,
+    passthrough: Vec<String>,
+    codex_linux_sandbox_exe: Option<PathBuf>,
+) -> Result<()> {
+    let overrides = parse_plain_overrides(config_overrides)?;
+
+    let ServeArgs {
+        expose_all_tools,
+        enable_foo,
+        max_aux_agents,
+    } = serve_flags;
+
+    eprintln!(
+        "[mcp] expose_all_tools={} enable_foo={}",
+        expose_all_tools, enable_foo
+    );
+    if let Some(limit) = max_aux_agents {
+        eprintln!("[mcp] max_aux_agents={limit}");
+    }
+    if !passthrough.is_empty() {
+        eprintln!("[mcp] passthrough args ignored: {passthrough:?}");
+    }
+
+    let run_options = codex_mcp_server::McpServerRunOptions {
+        opts: codex_mcp_server::McpServerOpts {
+            expose_all_tools,
+            enable_foo,
+            overrides,
+        },
+        max_aux_agents,
+    };
+
+    codex_mcp_server::run_main(codex_linux_sandbox_exe, run_options)
+        .await
+        .map_err(|e| anyhow!(e))
+}
+
+fn finalize_serve_args(
+    global: ServeArgs,
+    subcommand: Option<ServeCommandArgs>,
+) -> (ServeArgs, Vec<String>) {
+    match subcommand {
+        Some(sub_args) => (
+            ServeArgs {
+                expose_all_tools: global.expose_all_tools || sub_args.flags.expose_all_tools,
+                enable_foo: global.enable_foo || sub_args.flags.enable_foo,
+                max_aux_agents: sub_args.flags.max_aux_agents.or(global.max_aux_agents),
+            },
+            sub_args.passthrough,
+        ),
+        None => (global, Vec::new()),
+    }
+}
+
+fn warn_ignored_serve_flags(args: &ServeArgs, passthrough: &[String], subcommand: &str) {
+    let mut ignored_flags = Vec::new();
+    if args.expose_all_tools {
+        ignored_flags.push("--expose-all-tools");
+    }
+    if args.enable_foo {
+        ignored_flags.push("--enable-foo");
+    }
+    if args.max_aux_agents.is_some() {
+        ignored_flags.push("--max-aux-agents");
+    }
+
+    if !ignored_flags.is_empty() {
+        eprintln!("[mcp] warning: {ignored_flags:?} ignored for `codex mcp {subcommand}`");
+    }
+
+    if !passthrough.is_empty() {
+        eprintln!(
+            "[mcp] warning: passthrough arguments ignored for `codex mcp {subcommand}`: {:?}",
+            passthrough
+        );
+    }
+}
+
 fn parse_plain_overrides(overrides: &CliConfigOverrides) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
     for raw in &overrides.raw_overrides {
@@ -457,12 +557,78 @@ fn validate_server_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use pretty_assertions::assert_eq;
 
     fn overrides_from(raw: &[&str]) -> CliConfigOverrides {
         CliConfigOverrides {
             raw_overrides: raw.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn top_level_flags_default_to_serve() {
+        let cli = McpCli::try_parse_from(["mcp", "--expose-all-tools"]).expect("parse");
+        assert!(cli.cmd.is_none());
+        assert!(cli.serve_args.expose_all_tools);
+        assert!(!cli.serve_args.enable_foo);
+    }
+
+    #[test]
+    fn serve_subcommand_preserves_flags() {
+        let cli = McpCli::try_parse_from(["mcp", "serve", "--enable-foo"]).expect("parse");
+        match cli.cmd {
+            Some(McpSubcommand::Serve(args)) => assert!(args.flags.enable_foo),
+            other => panic!("expected serve subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn passthrough_captured_for_serve() {
+        let cli = McpCli::try_parse_from(["mcp", "serve", "--", "--cli", "--method", "tools/list"])
+            .expect("parse");
+        match cli.cmd {
+            Some(McpSubcommand::Serve(args)) => {
+                assert_eq!(
+                    args.passthrough,
+                    vec![
+                        "--cli".to_string(),
+                        "--method".to_string(),
+                        "tools/list".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected serve subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_subcommand_tolerates_serve_flags() {
+        let cli = McpCli::try_parse_from(["mcp", "list", "--expose-all-tools"]).expect("parse");
+        assert!(matches!(cli.cmd, Some(McpSubcommand::List(_))));
+        assert!(cli.serve_args.expose_all_tools);
+    }
+
+    #[test]
+    fn finalize_serve_args_combines_global_and_sub_flags() {
+        let mut global = ServeArgs::default();
+        global.expose_all_tools = true;
+
+        let mut sub = ServeCommandArgs::default();
+        sub.flags.enable_foo = true;
+        sub.flags.max_aux_agents = Some(3);
+
+        let (combined_flags, passthrough) = finalize_serve_args(global.clone(), Some(sub.clone()));
+        assert!(combined_flags.expose_all_tools);
+        assert!(combined_flags.enable_foo);
+        assert_eq!(combined_flags.max_aux_agents, Some(3));
+        assert!(passthrough.is_empty());
+
+        let mut sub_passthrough = ServeCommandArgs::default();
+        sub_passthrough.passthrough = vec!["--method".to_string()];
+        let (_combined_flags, combined_passthrough) =
+            finalize_serve_args(global.clone(), Some(sub_passthrough.clone()));
+        assert_eq!(combined_passthrough, sub_passthrough.passthrough);
     }
 
     #[test]
