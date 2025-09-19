@@ -90,7 +90,7 @@ const AUX_TOOLS: &[(&str, &str)] = &[
     ),
 ];
 
-pub fn compute_tool_names(opts: &McpServerOpts, _max_aux_agents: Option<usize>) -> Vec<String> {
+pub fn compute_tool_names(opts: &McpServerOpts, max_aux_agents: Option<usize>) -> Vec<String> {
     let mut ordered = Vec::new();
     ordered.push("reply".to_string());
 
@@ -102,8 +102,10 @@ pub fn compute_tool_names(opts: &McpServerOpts, _max_aux_agents: Option<usize>) 
             ordered.push((*name).to_string());
         }
 
-        for (name, _) in AUX_TOOLS {
-            ordered.push((*name).to_string());
+        if max_aux_agents.unwrap_or(0) > 0 {
+            for (name, _) in AUX_TOOLS {
+                ordered.push((*name).to_string());
+            }
         }
     }
 
@@ -237,7 +239,7 @@ mod tests {
     fn expose_all_tools_includes_core_and_aux() {
         let mut opts = empty_opts();
         opts.expose_all_tools = true;
-        let names = compute_tool_names(&opts, None);
+        let names = compute_tool_names(&opts, Some(3));
         assert!(names.contains(&"codex.spawnAuxAgent".to_string()));
         assert!(names.contains(&"codex".to_string()));
     }
@@ -248,7 +250,11 @@ mod tests {
         opts.expose_all_tools = true;
         let tools = list_tools(&opts, Some(0)).expect("list tools");
         let names: Vec<_> = tools.iter().map(|tool| tool.name.clone()).collect();
-        assert!(names.contains(&"codex.spawnAuxAgent".to_string()));
         assert!(names.contains(&"codex".to_string()));
+        assert!(!names.contains(&"codex.spawnAuxAgent".to_string()));
+
+        let tools_enabled = list_tools(&opts, Some(4)).expect("list tools");
+        let enabled_names: Vec<_> = tools_enabled.iter().map(|tool| tool.name.clone()).collect();
+        assert!(enabled_names.contains(&"codex.spawnAuxAgent".to_string()));
     }
 }
