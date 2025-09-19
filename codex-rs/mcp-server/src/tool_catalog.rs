@@ -90,13 +90,9 @@ const AUX_TOOLS: &[(&str, &str)] = &[
     ),
 ];
 
-pub fn compute_tool_names(opts: &McpServerOpts, max_aux_agents: Option<usize>) -> Vec<String> {
+pub fn compute_tool_names(opts: &McpServerOpts, _max_aux_agents: Option<usize>) -> Vec<String> {
     let mut ordered = Vec::new();
     ordered.push("reply".to_string());
-
-    if opts.enable_foo {
-        ordered.push("foo".to_string());
-    }
 
     if opts.expose_all_tools {
         ordered.push("codex".to_string());
@@ -106,10 +102,8 @@ pub fn compute_tool_names(opts: &McpServerOpts, max_aux_agents: Option<usize>) -
             ordered.push((*name).to_string());
         }
 
-        if max_aux_agents.unwrap_or(0) > 0 {
-            for (name, _) in AUX_TOOLS {
-                ordered.push((*name).to_string());
-            }
+        for (name, _) in AUX_TOOLS {
+            ordered.push((*name).to_string());
         }
     }
 
@@ -129,8 +123,7 @@ pub fn list_tools(
             return Err(format!("duplicate tool '{name}'"));
         }
 
-        let tool = build_tool_by_name(&name, max_aux_agents)
-            .ok_or_else(|| format!("unknown tool '{name}'"))?;
+        let tool = build_tool_by_name(&name).ok_or_else(|| format!("unknown tool '{name}'"))?;
         validate_tool_schema(&tool)?;
         tools.push(tool);
     }
@@ -144,28 +137,25 @@ fn dedupe_preserving_order(mut names: Vec<String>) -> Vec<String> {
     names
 }
 
-fn build_tool_by_name(name: &str, max_aux_agents: Option<usize>) -> Option<Tool> {
+fn build_tool_by_name(name: &str) -> Option<Tool> {
     match name {
         "reply" => Some(create_reply_tool()),
-        "foo" => Some(create_foo_tool()),
         "codex" => Some(create_tool_for_codex_tool_call_param()),
         "codex-reply" => Some(create_tool_for_codex_tool_call_reply_param()),
-        other => full_action_tool_by_name(other, max_aux_agents),
+        other => full_action_tool_by_name(other),
     }
 }
 
-fn full_action_tool_by_name(name: &str, max_aux_agents: Option<usize>) -> Option<Tool> {
+fn full_action_tool_by_name(name: &str) -> Option<Tool> {
     for (tool_name, description) in ACTION_TOOLS {
         if *tool_name == name {
             return Some(build_simple_tool(tool_name, description));
         }
     }
 
-    if max_aux_agents.unwrap_or(0) > 0 {
-        for (tool_name, description) in AUX_TOOLS {
-            if *tool_name == name {
-                return Some(build_simple_tool(tool_name, description));
-            }
+    for (tool_name, description) in AUX_TOOLS {
+        if *tool_name == name {
+            return Some(build_simple_tool(tool_name, description));
         }
     }
 
@@ -187,30 +177,6 @@ fn create_reply_tool() -> Tool {
         input_schema: ToolInputSchema {
             properties: Some(properties),
             required: Some(vec!["prompt".to_string()]),
-            r#type: "object".to_string(),
-        },
-        output_schema: None,
-        annotations: None,
-    }
-}
-
-fn create_foo_tool() -> Tool {
-    let properties = json!({
-        "message": {
-            "type": "string",
-            "description": "Optional text echoed back for diagnostics.",
-        }
-    });
-
-    Tool {
-        name: "foo".to_string(),
-        title: Some("Foo".to_string()),
-        description: Some(
-            "Internal diagnostics tool exposed when --enable-foo is set.".to_string(),
-        ),
-        input_schema: ToolInputSchema {
-            properties: Some(properties),
-            required: None,
             r#type: "object".to_string(),
         },
         output_schema: None,
@@ -257,7 +223,6 @@ mod tests {
     fn empty_opts() -> McpServerOpts {
         McpServerOpts {
             expose_all_tools: false,
-            enable_foo: false,
             overrides: Default::default(),
         }
     }
@@ -269,31 +234,21 @@ mod tests {
     }
 
     #[test]
-    fn enable_foo_adds_flagged_tool() {
-        let mut opts = empty_opts();
-        opts.enable_foo = true;
-        let names = compute_tool_names(&opts, None);
-        assert_eq!(names, vec!["reply".to_string(), "foo".to_string()]);
-    }
-
-    #[test]
     fn expose_all_tools_includes_core_and_aux() {
         let mut opts = empty_opts();
         opts.expose_all_tools = true;
-        let names = compute_tool_names(&opts, Some(2));
-        assert!(names.contains(&"codex".to_string()));
-        assert!(names.contains(&"codex.execCommand".to_string()));
+        let names = compute_tool_names(&opts, None);
         assert!(names.contains(&"codex.spawnAuxAgent".to_string()));
-        assert!(names.contains(&"reply".to_string()));
-        assert!(!names.contains(&"foo".to_string()));
+        assert!(names.contains(&"codex".to_string()));
     }
 
     #[test]
     fn list_tools_validates_and_returns_structures() {
         let mut opts = empty_opts();
-        opts.enable_foo = true;
-        let tools = list_tools(&opts, None).expect("list tools");
+        opts.expose_all_tools = true;
+        let tools = list_tools(&opts, Some(0)).expect("list tools");
         let names: Vec<_> = tools.iter().map(|tool| tool.name.clone()).collect();
-        assert_eq!(names, vec!["reply".to_string(), "foo".to_string()]);
+        assert!(names.contains(&"codex.spawnAuxAgent".to_string()));
+        assert!(names.contains(&"codex".to_string()));
     }
 }

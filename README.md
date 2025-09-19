@@ -81,7 +81,7 @@ Model Context Protocol support lets you expose Codex as a server or consume othe
 
 - When the Inspector needs its own runtime flags, place `--` between Codex options and Inspector arguments so Clap stops parsing (`codex mcp -- --cli …`).
 
-- `codex mcp serve` accepts `--expose-all-tools` to surface the full Codex toolset and `--enable-foo` to expose the diagnostic `foo` tool. Logs are written to stderr so stdio remains protocol-clean.
+- `codex mcp serve` accepts `--expose-all-tools` to surface the full Codex toolset. Use `--max-aux-agents <N>` to allow up to `N` concurrent auxiliary agents; this limit is independent of tool exposure. Logs are written to stderr so stdio remains protocol-clean.
 
 - Node.js 18 or newer is required for the Inspector packages.
 

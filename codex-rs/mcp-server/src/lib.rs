@@ -53,12 +53,8 @@ const CHANNEL_CAPACITY: usize = 128;
 #[derive(Clone, Debug, Default)]
 pub struct McpServerOpts {
     /// When true, expose the full Codex action surface as MCP tools. When false,
-    /// only the lightweight `reply` tool (and any explicitly enabled tools)
-    /// will be advertised.
+    /// only the default tool surface (currently just `reply`) is advertised.
     pub expose_all_tools: bool,
-
-    /// Enables the experimental `foo` tool used internally for smoke testing.
-    pub enable_foo: bool,
 
     /// Simplistic `key=value` overrides captured from the CLI. Values are
     /// stored exactly as provided without attempting additional parsing.
@@ -77,7 +73,6 @@ impl Default for McpServerRunOptions {
         Self {
             opts: McpServerOpts {
                 expose_all_tools: true,
-                enable_foo: false,
                 overrides: HashMap::new(),
             },
             max_aux_agents: None,
@@ -137,6 +132,12 @@ pub async fn run_main(
         .map_err(|e| {
             std::io::Error::new(ErrorKind::InvalidData, format!("error loading config: {e}"))
         })?;
+
+    debug!(
+        expose_all_tools = options.opts.expose_all_tools,
+        max_aux_agents = options.max_aux_agents,
+        "starting MCP server"
+    );
 
     // Task: process incoming messages.
     let processor_handle = tokio::spawn({
