@@ -86,4 +86,11 @@ pub(crate) enum AppEvent {
     PlanningSetPlannerModel(String),
     /// User selected the Reviewer model (model slug).
     PlanningSetReviewerModel(String),
+
+    /// Start client-only planning orchestration with picked models and optional user notes.
+    StartClientPlanning {
+        planner_model: String,
+        reviewer_model: String,
+        notes: String,
+    },
 }

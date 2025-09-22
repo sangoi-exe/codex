@@ -63,6 +63,9 @@ apply_patch/
 # coverage
 coverage/
 
+# Rust/cargo caches (do not track local cargo home)
+/.cargo-home/
+
 # os
 .DS_Store
 Thumbs.db

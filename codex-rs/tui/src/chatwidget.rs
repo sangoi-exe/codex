@@ -100,9 +100,9 @@ use codex_common::model_presets::builtin_model_presets;
 use codex_core::AuthManager;
 use codex_core::ConversationManager;
 use codex_core::protocol::AskForApproval;
-use codex_core::protocol::PlanningRequest;
 use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol_config_types::ReasoningEffort as ReasoningEffortConfig;
+use codex_core::protocol_config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_file_search::FileMatch;
 use std::path::Path;
 
@@ -197,7 +197,29 @@ pub(crate) struct ChatWidget {
     // Temporary storage for planning flow
     pending_planner_model: Option<String>,
     pending_reviewer_model: Option<String>,
+    planning_state: Option<PlanningState>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlanningStage {
+    PlannerFirst,
+    Reviewer,
+    PlannerFinal,
+}
+
+struct PlanningState {
+    stage: PlanningStage,
+    planner_model: String,
+    reviewer_model: String,
+    user_notes: String,
+    planner_output: Option<String>,
+    reviewer_output: Option<String>,
+}
+
+const PLANNER_PROMPT_BASE: &str = "You are the Planner for this repository. Analyze the user's task, explore files and docs as needed (using tools), and produce a concise, actionable plan.\nInclude milestones, owners (Planner/Reviewer), and explicit commands only when necessary. Avoid redundant scanning and boilerplate.";
+const REVIEWER_PROMPT_BASE: &str = "You are the Reviewer. Critique the plan for completeness, risks, and clarity. Propose concrete fixes and improvements concisely without restating the entire plan.";
+const DEFAULT_PLANNING_TASK: &str =
+    "Infer the user's current objective from the recent conversation and repository state.";
 
 struct UserMessage {
     text: String,
@@ -323,12 +345,40 @@ impl ChatWidget {
         self.running_commands.clear();
         self.request_redraw();
 
+        // Continue client-only planning orchestration if active.
+        self.continue_planning_if_needed(last_agent_message.clone());
         // If there is a queued user message, send exactly one now to begin the next turn.
         self.maybe_send_next_queued_input();
         // Emit a notification when the turn completes (suppressed if focused).
         self.notify(Notification::AgentTurnComplete {
             response: last_agent_message.unwrap_or_default(),
         });
+    }
+
+    fn continue_planning_if_needed(&mut self, last_agent_message: Option<String>) {
+        let Some(mut state) = self.planning_state.take() else {
+            return;
+        };
+        match state.stage {
+            PlanningStage::PlannerFirst => {
+                state.planner_output = last_agent_message;
+                state.stage = PlanningStage::Reviewer;
+                self.planning_state = Some(state);
+                self.run_reviewer();
+            }
+            PlanningStage::Reviewer => {
+                state.reviewer_output = last_agent_message;
+                state.stage = PlanningStage::PlannerFinal;
+                self.planning_state = Some(state);
+                self.run_planner_final();
+            }
+            PlanningStage::PlannerFinal => {
+                // Finished
+                let banner = "<< Planning finished >>".to_string();
+                self.add_to_history(history_cell::new_review_status_line(banner));
+                self.planning_state = None;
+            }
+        }
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
@@ -780,6 +830,7 @@ impl ChatWidget {
             is_review_mode: false,
             pending_planner_model: None,
             pending_reviewer_model: None,
+            planning_state: None,
         }
     }
 
@@ -841,6 +892,7 @@ impl ChatWidget {
             is_review_mode: false,
             pending_planner_model: None,
             pending_reviewer_model: None,
+            planning_state: None,
         }
     }
 
@@ -1129,7 +1181,7 @@ impl ChatWidget {
 
     pub(crate) fn on_planning_set_reviewer_model(&mut self, model: String) {
         self.pending_reviewer_model = Some(model);
-        // Show a prompt to enter the task
+        // Ask user for an optional complementary task (will be appended to defaults).
         self.open_planning_task_prompt();
     }
 
@@ -1148,26 +1200,158 @@ impl ChatWidget {
         let tx = self.app_event_tx.clone();
         let on_submit: crate::bottom_pane::custom_prompt_view::PromptSubmitted =
             Box::new(move |text: String| {
-                tx.send(AppEvent::CodexOp(Op::Planning {
-                    request: PlanningRequest {
-                        planner_model: planner.clone(),
-                        reviewer_model: reviewer.clone(),
-                        task_prompt: text,
-                    },
-                }));
+                tx.send(AppEvent::StartClientPlanning {
+                    planner_model: planner.clone(),
+                    reviewer_model: reviewer.clone(),
+                    notes: text,
+                });
             });
         let context_label = Some(format!(
             "Planner: {planner_label} | Reviewer: {reviewer_label}"
         ));
+        // Press Enter to submit details; Esc to start with defaults.
+        let on_escape: crate::bottom_pane::SelectionAction = Box::new({
+            let tx2 = self.app_event_tx.clone();
+            let planner2 = planner_label.clone();
+            let reviewer2 = reviewer_label.clone();
+            move |tx: &AppEventSender| {
+                let _ = tx; // unused; use outer tx2
+                tx2.send(AppEvent::StartClientPlanning {
+                    planner_model: planner2.clone(),
+                    reviewer_model: reviewer2.clone(),
+                    notes: String::new(),
+                });
+            }
+        });
+
         let view = CustomPromptView::new(
             "Planning task".to_string(),
-            "Describe the task to plan".to_string(),
+            "Optionally add details to complement the default planning prompts (leave blank for defaults).".to_string(),
             context_label,
             self.app_event_tx.clone(),
-            None,
+            Some(on_escape),
             on_submit,
         );
         self.bottom_pane.show_view(Box::new(view));
+    }
+
+    pub(crate) fn start_client_planning(
+        &mut self,
+        planner_model: String,
+        reviewer_model: String,
+        notes: String,
+    ) {
+        self.planning_state = Some(PlanningState {
+            stage: PlanningStage::PlannerFirst,
+            planner_model: planner_model.clone(),
+            reviewer_model: reviewer_model.clone(),
+            user_notes: notes.clone(),
+            planner_output: None,
+            reviewer_output: None,
+        });
+        let banner = format!(
+            ">> Planning started (planner: {}, reviewer: {}) <<",
+            planner_model, reviewer_model
+        );
+        self.add_to_history(history_cell::new_review_status_line(banner));
+        self.request_redraw();
+        self.run_planner_first();
+    }
+
+    fn run_planner_first(&mut self) {
+        if let Some(state) = &self.planning_state {
+            let planner_model = state.planner_model.clone();
+            let user_notes = state.user_notes.clone();
+            let task_text = if user_notes.trim().is_empty() {
+                DEFAULT_PLANNING_TASK.to_string()
+            } else {
+                format!(
+                    "{}\n\nAdditional user notes:\n{}",
+                    DEFAULT_PLANNING_TASK, user_notes
+                )
+            };
+            let prompt = format!(
+                "{}\n\n---\n\nTask: {}\n\nStart by outlining a plan. If you need to inspect files, do so briefly and only as needed.",
+                PLANNER_PROMPT_BASE, task_text
+            );
+            let effort = self.model_effort_for(&planner_model);
+            self.send_user_turn_with_model(
+                &planner_model,
+                effort,
+                ReasoningSummaryConfig::Detailed,
+                prompt,
+            );
+        }
+    }
+
+    fn run_reviewer(&mut self) {
+        if let Some(state) = &self.planning_state {
+            let planner_plan = state
+                .planner_output
+                .clone()
+                .unwrap_or_else(|| "(no planner output)".to_string());
+            let prompt = format!(
+                "{}\n\n---\n\nPlease review the following plan and propose improvements, fixes, and risks succinctly. If user notes were provided, ensure they are addressed.\n\n{}",
+                REVIEWER_PROMPT_BASE, planner_plan
+            );
+            let reviewer_model = state.reviewer_model.clone();
+            let effort = self.model_effort_for(&reviewer_model);
+            self.send_user_turn_with_model(
+                &reviewer_model,
+                effort,
+                ReasoningSummaryConfig::Detailed,
+                prompt,
+            );
+        }
+    }
+
+    fn run_planner_final(&mut self) {
+        if let Some(state) = &self.planning_state {
+            let reviewer_feedback = state
+                .reviewer_output
+                .clone()
+                .unwrap_or_else(|| "(no reviewer feedback)".to_string());
+            let prompt = format!(
+                "{}\n\n---\n\nIncorporate the following review feedback and output the final plan (no extra commentary):\n\n{}",
+                PLANNER_PROMPT_BASE, reviewer_feedback
+            );
+            let planner_model = state.planner_model.clone();
+            let effort = self.model_effort_for(&planner_model);
+            self.send_user_turn_with_model(
+                &planner_model,
+                effort,
+                ReasoningSummaryConfig::Detailed,
+                prompt,
+            );
+        }
+    }
+
+    fn model_effort_for(&self, model: &str) -> Option<ReasoningEffortConfig> {
+        let auth_mode = self.auth_manager.auth().map(|a| a.mode);
+        let presets = builtin_model_presets(auth_mode);
+        presets
+            .iter()
+            .find(|p| p.model == model)
+            .and_then(|p| p.effort)
+    }
+
+    fn send_user_turn_with_model(
+        &mut self,
+        model: &str,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        text: String,
+    ) {
+        self.clear_token_usage();
+        self.app_event_tx.send(AppEvent::CodexOp(Op::UserTurn {
+            items: vec![InputItem::Text { text }],
+            cwd: self.config.cwd.clone(),
+            approval_policy: self.config.approval_policy,
+            sandbox_policy: self.config.sandbox_policy.clone(),
+            model: model.to_string(),
+            effort,
+            summary,
+        }));
     }
 
     pub(crate) fn handle_paste(&mut self, text: String) {
@@ -1358,29 +1542,7 @@ impl ChatWidget {
                 self.on_entered_review_mode(review_request)
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
-            EventMsg::EnteredPlanningMode(req) => {
-                let banner = format!(
-                    ">> Planning started (planner: {}, reviewer: {}) <<",
-                    req.planner_model, req.reviewer_model
-                );
-                self.add_to_history(history_cell::new_review_status_line(banner));
-                self.request_redraw();
-            }
-            EventMsg::ExitedPlanningMode(ev) => {
-                // Flush stream, then show final plan as agent message
-                self.flush_answer_stream_with_separator();
-                self.flush_interrupt_queue();
-                self.flush_active_exec_cell();
-                let mut message_lines: Vec<ratatui::text::Line<'static>> = Vec::new();
-                append_markdown(&ev.plan_text, &mut message_lines, &self.config);
-                let body_cell = AgentMessageCell::new(message_lines, true);
-                self.app_event_tx
-                    .send(AppEvent::InsertHistoryCell(Box::new(body_cell)));
-                self.add_to_history(history_cell::new_review_status_line(
-                    "<< Planning finished >>".to_string(),
-                ));
-                self.request_redraw();
-            }
+            // client-only planning: no core planning events handled here
         }
     }
 

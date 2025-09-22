@@ -375,6 +375,14 @@ impl App {
             AppEvent::PlanningSetReviewerModel(model) => {
                 self.chat_widget.on_planning_set_reviewer_model(model);
             }
+            AppEvent::StartClientPlanning {
+                planner_model,
+                reviewer_model,
+                notes,
+            } => {
+                self.chat_widget
+                    .start_client_planning(planner_model, reviewer_model, notes);
+            }
         }
         Ok(true)
     }
