@@ -267,6 +267,56 @@ fn exited_review_mode_emits_results_and_finishes() {
     assert!(!chat.is_review_mode);
 }
 
+/// Planning (client-only): starting planning prints a started banner and sets internal state.
+#[test]
+fn planning_client_only_start_banner() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual();
+
+    // Start planning with two models and no additional notes
+    chat.start_client_planning(
+        "gpt-5".to_string(),
+        "gpt-5-codex".to_string(),
+        String::new(),
+    );
+
+    // Drain history and expect the started banner
+    let cells = drain_insert_history(&mut rx);
+    let banner = lines_to_single_string(cells.last().expect("planning banner"));
+    assert_eq!(
+        banner,
+        ">> Planning started (planner: gpt-5, reviewer: gpt-5-codex) <<\n"
+    );
+}
+
+/// Planning (client-only): completing three turns emits the finished banner.
+#[test]
+fn planning_client_only_finishes_after_three_turns() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual();
+
+    chat.start_client_planning(
+        "gpt-5".to_string(),
+        "gpt-5-codex".to_string(),
+        String::new(),
+    );
+    // Clear the start banner insertion
+    let _ = drain_insert_history(&mut rx);
+
+    // Simulate the three task completions (Planner → Reviewer → PlannerFinal)
+    chat.on_task_complete(Some("planner v1".to_string()));
+    let _ = drain_insert_history(&mut rx); // reviewer launch might not insert history immediately
+    chat.on_task_complete(Some("review feedback".to_string()));
+    let _ = drain_insert_history(&mut rx); // planner final launch
+    chat.on_task_complete(Some("final plan".to_string()));
+
+    // Expect the finished banner appeared in history.
+    let cells = drain_insert_history(&mut rx);
+    let found_finished = cells.iter().any(|lines| {
+        let s = lines_to_single_string(lines);
+        s.contains("<< Planning finished >>")
+    });
+    assert!(found_finished, "expected finished planning banner");
+}
+
 #[cfg_attr(
     target_os = "macos",
     ignore = "system configuration APIs are blocked under macOS seatbelt"

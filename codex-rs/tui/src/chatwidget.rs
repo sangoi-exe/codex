@@ -1212,8 +1212,8 @@ impl ChatWidget {
         // Press Enter to submit details; Esc to start with defaults.
         let on_escape: crate::bottom_pane::SelectionAction = Box::new({
             let tx2 = self.app_event_tx.clone();
-            let planner2 = planner_label.clone();
-            let reviewer2 = reviewer_label.clone();
+            let planner2 = planner_label;
+            let reviewer2 = reviewer_label;
             move |tx: &AppEventSender| {
                 let _ = tx; // unused; use outer tx2
                 tx2.send(AppEvent::StartClientPlanning {
@@ -1245,13 +1245,12 @@ impl ChatWidget {
             stage: PlanningStage::PlannerFirst,
             planner_model: planner_model.clone(),
             reviewer_model: reviewer_model.clone(),
-            user_notes: notes.clone(),
+            user_notes: notes,
             planner_output: None,
             reviewer_output: None,
         });
         let banner = format!(
-            ">> Planning started (planner: {}, reviewer: {}) <<",
-            planner_model, reviewer_model
+            ">> Planning started (planner: {planner_model}, reviewer: {reviewer_model}) <<"
         );
         self.add_to_history(history_cell::new_review_status_line(banner));
         self.request_redraw();
@@ -1266,13 +1265,11 @@ impl ChatWidget {
                 DEFAULT_PLANNING_TASK.to_string()
             } else {
                 format!(
-                    "{}\n\nAdditional user notes:\n{}",
-                    DEFAULT_PLANNING_TASK, user_notes
+                    "{DEFAULT_PLANNING_TASK}\n\nAdditional user notes:\n{user_notes}"
                 )
             };
             let prompt = format!(
-                "{}\n\n---\n\nTask: {}\n\nStart by outlining a plan. If you need to inspect files, do so briefly and only as needed.",
-                PLANNER_PROMPT_BASE, task_text
+                "{PLANNER_PROMPT_BASE}\n\n---\n\nTask: {task_text}\n\nStart by outlining a plan. If you need to inspect files, do so briefly and only as needed."
             );
             let effort = self.model_effort_for(&planner_model);
             self.send_user_turn_with_model(
@@ -1291,8 +1288,7 @@ impl ChatWidget {
                 .clone()
                 .unwrap_or_else(|| "(no planner output)".to_string());
             let prompt = format!(
-                "{}\n\n---\n\nPlease review the following plan and propose improvements, fixes, and risks succinctly. If user notes were provided, ensure they are addressed.\n\n{}",
-                REVIEWER_PROMPT_BASE, planner_plan
+                "{REVIEWER_PROMPT_BASE}\n\n---\n\nPlease review the following plan and propose improvements, fixes, and risks succinctly. If user notes were provided, ensure they are addressed.\n\n{planner_plan}"
             );
             let reviewer_model = state.reviewer_model.clone();
             let effort = self.model_effort_for(&reviewer_model);
@@ -1312,8 +1308,7 @@ impl ChatWidget {
                 .clone()
                 .unwrap_or_else(|| "(no reviewer feedback)".to_string());
             let prompt = format!(
-                "{}\n\n---\n\nIncorporate the following review feedback and output the final plan (no extra commentary):\n\n{}",
-                PLANNER_PROMPT_BASE, reviewer_feedback
+                "{PLANNER_PROMPT_BASE}\n\n---\n\nIncorporate the following review feedback and output the final plan (no extra commentary):\n\n{reviewer_feedback}"
             );
             let planner_model = state.planner_model.clone();
             let effort = self.model_effort_for(&planner_model);
