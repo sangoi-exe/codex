@@ -221,6 +221,232 @@ pub(crate) fn create_tool_for_codex_tool_call_reply_param() -> Tool {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Additional Code-Editing Tools
+// -----------------------------------------------------------------------------
+
+/// Input for the `execCommand` MCP tool. Mirrors a subset of ExecOneOffCommandParams.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecCommandToolParam {
+    /// Command argv to execute.
+    pub command: Vec<String>,
+
+    /// Timeout of the command in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+
+    /// Working directory for the command. Resolved against the server cwd if relative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+/// Build a Tool schema for `execCommand`.
+pub(crate) fn create_tool_for_exec_command() -> Tool {
+    let schema = SchemaSettings::draft2019_09()
+        .with(|s| {
+            s.inline_subschemas = true;
+            s.option_add_null_type = false;
+        })
+        .into_generator()
+        .into_root_schema_for::<ExecCommandToolParam>();
+
+    #[expect(clippy::expect_used)]
+    let schema_value =
+        serde_json::to_value(&schema).expect("execCommand tool schema should serialise to JSON");
+
+    let tool_input_schema = serde_json::from_value::<ToolInputSchema>(schema_value)
+        .unwrap_or_else(|e| panic!("failed to create Tool from schema: {e}"));
+
+    Tool {
+        name: "execCommand".to_string(),
+        title: Some("Execute Command".to_string()),
+        input_schema: tool_input_schema,
+        output_schema: None,
+        description: Some(
+            "Execute a one-off shell command under the server's sandbox with timeout and optional cwd.".to_string(),
+        ),
+        annotations: None,
+    }
+}
+
+/// Input for the `gitDiffToRemote` MCP tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDiffToRemoteToolParam {
+    /// Absolute or relative working directory of the git repo.
+    pub cwd: String,
+}
+
+pub(crate) fn create_tool_for_git_diff_to_remote() -> Tool {
+    let schema = SchemaSettings::draft2019_09()
+        .with(|s| {
+            s.inline_subschemas = true;
+            s.option_add_null_type = false;
+        })
+        .into_generator()
+        .into_root_schema_for::<GitDiffToRemoteToolParam>();
+
+    #[expect(clippy::expect_used)]
+    let schema_value = serde_json::to_value(&schema)
+        .expect("gitDiffToRemote tool schema should serialise to JSON");
+
+    let tool_input_schema = serde_json::from_value::<ToolInputSchema>(schema_value)
+        .unwrap_or_else(|e| panic!("failed to create Tool from schema: {e}"));
+
+    Tool {
+        name: "gitDiffToRemote".to_string(),
+        title: Some("Git Diff To Remote".to_string()),
+        input_schema: tool_input_schema,
+        output_schema: None,
+        description: Some(
+            "Return the git diff to the tracked remote (and HEAD SHA) for the given cwd."
+                .to_string(),
+        ),
+        annotations: None,
+    }
+}
+
+/// Empty input for the `getUserSavedConfig` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct GetUserSavedConfigToolParam {}
+
+/// Provide a short alias for `codex-reply` named `reply`.
+
+/// Input for the `applyPatch` MCP tool. Accepts a unified diff patch body.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyPatchToolParam {
+    /// Unified diff (single string) that describes file additions/updates/deletions.
+    pub patch: String,
+
+    /// Optional working directory against which relative paths in the patch are resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+pub(crate) fn create_tool_for_apply_patch() -> Tool {
+    let schema = SchemaSettings::draft2019_09()
+        .with(|s| {
+            s.inline_subschemas = true;
+            s.option_add_null_type = false;
+        })
+        .into_generator()
+        .into_root_schema_for::<ApplyPatchToolParam>();
+
+    #[expect(clippy::expect_used)]
+    let schema_value =
+        serde_json::to_value(&schema).expect("applyPatch tool schema should serialise to JSON");
+
+    let tool_input_schema = serde_json::from_value::<ToolInputSchema>(schema_value)
+        .unwrap_or_else(|e| panic!("failed to create Tool from schema: {e}"));
+
+    Tool {
+        name: "applyPatch".to_string(),
+        title: Some("Apply Patch".to_string()),
+        input_schema: tool_input_schema,
+        output_schema: None,
+        description: Some(
+            "Apply a unified diff to the workspace under the server's sandbox.".to_string(),
+        ),
+        annotations: None,
+    }
+}
+
+/// Input for `codeSearch` MCP tool: fuzzy file search in the workspace.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeSearchToolParam {
+    /// Fuzzy pattern to match against file paths in the workspace.
+    pub pattern: String,
+
+    /// Maximum number of results to return (default 200).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+
+    /// Optional working directory to search (default: server cwd).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+
+    /// Glob patterns to exclude (e.g. "**/node_modules/**").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<Vec<String>>,
+
+    /// Whether to compute match indices for highlighting (slower).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compute_indices: Option<bool>,
+}
+
+pub(crate) fn create_tool_for_code_search() -> Tool {
+    let schema = SchemaSettings::draft2019_09()
+        .with(|s| {
+            s.inline_subschemas = true;
+            s.option_add_null_type = false;
+        })
+        .into_generator()
+        .into_root_schema_for::<CodeSearchToolParam>();
+
+    #[expect(clippy::expect_used)]
+    let schema_value =
+        serde_json::to_value(&schema).expect("codeSearch tool schema should serialise to JSON");
+
+    let tool_input_schema = serde_json::from_value::<ToolInputSchema>(schema_value)
+        .unwrap_or_else(|e| panic!("failed to create Tool from schema: {e}"));
+
+    Tool {
+        name: "codeSearch".to_string(),
+        title: Some("Code Search".to_string()),
+        input_schema: tool_input_schema,
+        output_schema: None,
+        description: Some("Fuzzy search for files in the workspace (paths only).".to_string()),
+        annotations: None,
+    }
+}
+
+/// Input for `readFile` MCP tool: read file contents from the workspace safely.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadFileToolParam {
+    /// File path to read. If relative, resolved against the server cwd. Must be inside the workspace root.
+    pub path: String,
+
+    /// Optional offset in bytes from which to start reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<u64>,
+
+    /// Maximum number of bytes to read (default 200_000; server-enforced cap applies).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+}
+
+pub(crate) fn create_tool_for_read_file() -> Tool {
+    let schema = SchemaSettings::draft2019_09()
+        .with(|s| {
+            s.inline_subschemas = true;
+            s.option_add_null_type = false;
+        })
+        .into_generator()
+        .into_root_schema_for::<ReadFileToolParam>();
+
+    #[expect(clippy::expect_used)]
+    let schema_value =
+        serde_json::to_value(&schema).expect("readFile tool schema should serialise to JSON");
+
+    let tool_input_schema = serde_json::from_value::<ToolInputSchema>(schema_value)
+        .unwrap_or_else(|e| panic!("failed to create Tool from schema: {e}"));
+
+    Tool {
+        name: "readFile".to_string(),
+        title: Some("Read File".to_string()),
+        input_schema: tool_input_schema,
+        output_schema: None,
+        description: Some(
+            "Read file contents from the workspace with offset/limit; rejects paths outside the workspace root.".to_string(),
+        ),
+        annotations: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -46,9 +46,16 @@ pub use crate::patch_approval::PatchApprovalResponse;
 /// plenty for an interactive CLI.
 const CHANNEL_CAPACITY: usize = 128;
 
+#[derive(Debug, Clone, Default)]
+pub struct ServerOptions {
+    /// When true, hide `codex`/`codex-reply` and expose only code-editing tools in the MCP tool catalog.
+    pub code_tools_only: bool,
+}
+
 pub async fn run_main(
     codex_linux_sandbox_exe: Option<PathBuf>,
     cli_config_overrides: CliConfigOverrides,
+    server_options: ServerOptions,
 ) -> IoResult<()> {
     // Install a simple subscriber so `tracing` output is visible.  Users can
     // control the log level with `RUST_LOG`.
@@ -104,6 +111,7 @@ pub async fn run_main(
             outgoing_message_sender,
             codex_linux_sandbox_exe,
             std::sync::Arc::new(config),
+            server_options,
         );
         async move {
             while let Some(msg) = incoming_rx.recv().await {

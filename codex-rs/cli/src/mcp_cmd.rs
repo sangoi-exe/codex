@@ -27,6 +27,9 @@ pub struct McpCli {
     #[clap(flatten)]
     pub config_overrides: CliConfigOverrides,
 
+    #[clap(flatten)]
+    pub serve_args: ServeArgs,
+
     #[command(subcommand)]
     pub cmd: Option<McpSubcommand>,
 }
@@ -34,7 +37,7 @@ pub struct McpCli {
 #[derive(Debug, clap::Subcommand)]
 pub enum McpSubcommand {
     /// [experimental] Run the Codex MCP server (stdio transport).
-    Serve,
+    Serve(ServeCommandArgs),
 
     /// [experimental] List configured MCP servers.
     List(ListArgs),
@@ -66,6 +69,13 @@ pub struct GetArgs {
     pub json: bool,
 }
 
+#[derive(Debug, clap::Args, Default, Clone)]
+pub struct ServeArgs {
+    /// Show only code-editing tools (hide `codex`/`codex-reply` from the MCP tool catalog)
+    #[arg(long = "code-tools-only", default_value_t = false)]
+    pub code_tools_only: bool,
+}
+
 #[derive(Debug, clap::Parser)]
 pub struct AddArgs {
     /// Name for the MCP server configuration.
@@ -86,17 +96,27 @@ pub struct RemoveArgs {
     pub name: String,
 }
 
+#[derive(Debug, clap::Parser, Default, Clone)]
+pub struct ServeCommandArgs {
+    #[command(flatten)]
+    pub flags: ServeArgs,
+}
+
 impl McpCli {
     pub async fn run(self, codex_linux_sandbox_exe: Option<PathBuf>) -> Result<()> {
         let McpCli {
             config_overrides,
+            serve_args,
             cmd,
         } = self;
-        let subcommand = cmd.unwrap_or(McpSubcommand::Serve);
+        let subcommand = cmd.unwrap_or(McpSubcommand::Serve(ServeCommandArgs::default()));
 
         match subcommand {
-            McpSubcommand::Serve => {
-                codex_mcp_server::run_main(codex_linux_sandbox_exe, config_overrides).await?;
+            McpSubcommand::Serve(sub_flags) => {
+                let opts = codex_mcp_server::ServerOptions {
+                    code_tools_only: serve_args.code_tools_only || sub_flags.flags.code_tools_only,
+                };
+                codex_mcp_server::run_main(codex_linux_sandbox_exe, config_overrides, opts).await?;
             }
             McpSubcommand::List(args) => {
                 run_list(&config_overrides, args)?;

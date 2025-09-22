@@ -4,18 +4,32 @@ use std::path::PathBuf;
 use crate::codex_message_processor::CodexMessageProcessor;
 use crate::codex_tool_config::CodexToolCallParam;
 use crate::codex_tool_config::CodexToolCallReplyParam;
+use crate::codex_tool_config::ExecCommandToolParam;
+use crate::codex_tool_config::GitDiffToRemoteToolParam;
+use crate::codex_tool_config::create_tool_for_apply_patch;
+use crate::codex_tool_config::create_tool_for_code_search;
 use crate::codex_tool_config::create_tool_for_codex_tool_call_param;
 use crate::codex_tool_config::create_tool_for_codex_tool_call_reply_param;
+use crate::codex_tool_config::create_tool_for_exec_command;
+use crate::codex_tool_config::create_tool_for_git_diff_to_remote;
+use crate::codex_tool_config::create_tool_for_read_file;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::outgoing_message::OutgoingMessageSender;
+use codex_file_search as file_search;
 use codex_protocol::mcp_protocol::ClientRequest;
 use codex_protocol::mcp_protocol::ConversationId;
 
+use base64::Engine as _;
 use codex_core::AuthManager;
+use codex_core::CODEX_APPLY_PATCH_ARG1;
 use codex_core::ConversationManager;
 use codex_core::config::Config;
 use codex_core::default_client::USER_AGENT_SUFFIX;
 use codex_core::default_client::get_codex_user_agent;
+use codex_core::exec::ExecParams;
+use codex_core::exec_env::create_env;
+use codex_core::get_platform_sandbox;
+use codex_core::git_info::git_diff_to_remote;
 use codex_core::protocol::Submission;
 use mcp_types::CallToolRequestParams;
 use mcp_types::CallToolResult;
@@ -32,6 +46,7 @@ use mcp_types::RequestId;
 use mcp_types::ServerCapabilitiesTools;
 use mcp_types::ServerNotification;
 use mcp_types::TextContent;
+use serde_json::Value;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -44,6 +59,8 @@ pub(crate) struct MessageProcessor {
     codex_linux_sandbox_exe: Option<PathBuf>,
     conversation_manager: Arc<ConversationManager>,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ConversationId>>>,
+    config: Arc<Config>,
+    opts: crate::ServerOptions,
 }
 
 impl MessageProcessor {
@@ -53,6 +70,7 @@ impl MessageProcessor {
         outgoing: OutgoingMessageSender,
         codex_linux_sandbox_exe: Option<PathBuf>,
         config: Arc<Config>,
+        opts: crate::ServerOptions,
     ) -> Self {
         let outgoing = Arc::new(outgoing);
         let auth_manager = AuthManager::shared(config.codex_home.clone());
@@ -62,7 +80,7 @@ impl MessageProcessor {
             conversation_manager.clone(),
             outgoing.clone(),
             codex_linux_sandbox_exe.clone(),
-            config,
+            config.clone(),
         );
         Self {
             codex_message_processor,
@@ -71,6 +89,8 @@ impl MessageProcessor {
             codex_linux_sandbox_exe,
             conversation_manager,
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
+            config,
+            opts,
         }
     }
 
@@ -318,11 +338,22 @@ impl MessageProcessor {
         params: <mcp_types::ListToolsRequest as mcp_types::ModelContextProtocolRequest>::Params,
     ) {
         tracing::trace!("tools/list -> {params:?}");
-        let result = ListToolsResult {
-            tools: vec![
+        let tools = if self.opts.code_tools_only {
+            vec![
+                create_tool_for_exec_command(),
+                create_tool_for_git_diff_to_remote(),
+                create_tool_for_apply_patch(),
+                create_tool_for_code_search(),
+                create_tool_for_read_file(),
+            ]
+        } else {
+            vec![
                 create_tool_for_codex_tool_call_param(),
                 create_tool_for_codex_tool_call_reply_param(),
-            ],
+            ]
+        };
+        let result = ListToolsResult {
+            tools,
             next_cursor: None,
         };
 
@@ -344,6 +375,25 @@ impl MessageProcessor {
                 self.handle_tool_call_codex_session_reply(id, arguments)
                     .await
             }
+            "reply" if !self.opts.code_tools_only => {
+                self.handle_tool_call_codex_session_reply(id, arguments)
+                    .await
+            }
+            "execCommand" if self.opts.code_tools_only => {
+                self.handle_tool_exec_command(id, arguments).await
+            }
+            "gitDiffToRemote" if self.opts.code_tools_only => {
+                self.handle_tool_git_diff_to_remote(id, arguments).await
+            }
+            "applyPatch" if self.opts.code_tools_only => {
+                self.handle_tool_apply_patch(id, arguments).await
+            }
+            "codeSearch" if self.opts.code_tools_only => {
+                self.handle_tool_code_search(id, arguments).await
+            }
+            "readFile" if self.opts.code_tools_only => {
+                self.handle_tool_read_file(id, arguments).await
+            }
             _ => {
                 let result = CallToolResult {
                     content: vec![ContentBlock::TextContent(TextContent {
@@ -358,6 +408,565 @@ impl MessageProcessor {
                     .await;
             }
         }
+    }
+
+    async fn handle_tool_exec_command(&self, request_id: RequestId, arguments: Option<Value>) {
+        let ExecCommandToolParam {
+            command,
+            timeout_ms,
+            cwd,
+        } = match arguments {
+            Some(json_val) => match serde_json::from_value::<ExecCommandToolParam>(json_val) {
+                Ok(params) => params,
+                Err(e) => {
+                    let result = CallToolResult {
+                        content: vec![ContentBlock::TextContent(TextContent {
+                            r#type: "text".to_owned(),
+                            text: format!("Failed to parse execCommand arguments: {e}"),
+                            annotations: None,
+                        })],
+                        is_error: Some(true),
+                        structured_content: None,
+                    };
+                    self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                        .await;
+                    return;
+                }
+            },
+            None => {
+                let result = CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        r#type: "text".to_string(),
+                        text: "Missing arguments for execCommand; the `command` array is required."
+                            .to_string(),
+                        annotations: None,
+                    })],
+                    is_error: Some(true),
+                    structured_content: None,
+                };
+                self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                    .await;
+                return;
+            }
+        };
+
+        if command.is_empty() {
+            let result = CallToolResult {
+                content: vec![ContentBlock::TextContent(TextContent {
+                    r#type: "text".to_string(),
+                    text: "execCommand: `command` must not be empty".to_string(),
+                    annotations: None,
+                })],
+                is_error: Some(true),
+                structured_content: None,
+            };
+            self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                .await;
+            return;
+        }
+
+        let cfg = self.config.as_ref();
+        let cwd_path = cwd.map(PathBuf::from).unwrap_or_else(|| cfg.cwd.clone());
+        let env = create_env(&cfg.shell_environment_policy);
+        let exec_params = ExecParams {
+            command,
+            cwd: cwd_path,
+            timeout_ms,
+            env,
+            with_escalated_permissions: None,
+            justification: None,
+        };
+
+        let effective_policy = cfg.sandbox_policy.clone();
+        let sandbox_type = match &effective_policy {
+            codex_core::protocol::SandboxPolicy::DangerFullAccess => {
+                codex_core::exec::SandboxType::None
+            }
+            _ => get_platform_sandbox().unwrap_or(codex_core::exec::SandboxType::None),
+        };
+
+        let outgoing = self.outgoing.clone();
+        let req_id = request_id;
+        let sandbox_cwd = cfg.cwd.clone();
+        let codex_linux_sandbox_exe = self.codex_linux_sandbox_exe.clone();
+
+        tokio::spawn(async move {
+            match codex_core::exec::process_exec_tool_call(
+                exec_params,
+                sandbox_type,
+                &effective_policy,
+                sandbox_cwd.as_path(),
+                &codex_linux_sandbox_exe,
+                None,
+            )
+            .await
+            {
+                Ok(output) => {
+                    let result = CallToolResult {
+                        content: vec![ContentBlock::TextContent(TextContent {
+                            r#type: "text".to_string(),
+                            text: format!(
+                                "exit_code={} (see structured_content)",
+                                output.exit_code
+                            ),
+                            annotations: None,
+                        })],
+                        is_error: Some(false),
+                        structured_content: Some(json!({
+                            "exit_code": output.exit_code,
+                            "stdout": output.stdout.text,
+                            "stderr": output.stderr.text,
+                        })),
+                    };
+                    outgoing.send_response(req_id, result).await;
+                }
+                Err(err) => {
+                    let result = CallToolResult {
+                        content: vec![ContentBlock::TextContent(TextContent {
+                            r#type: "text".to_string(),
+                            text: format!("execCommand failed: {err}"),
+                            annotations: None,
+                        })],
+                        is_error: Some(true),
+                        structured_content: None,
+                    };
+                    outgoing.send_response(req_id, result).await;
+                }
+            }
+        });
+    }
+
+    async fn handle_tool_git_diff_to_remote(
+        &self,
+        request_id: RequestId,
+        arguments: Option<Value>,
+    ) {
+        let params = match arguments
+            .and_then(|v| serde_json::from_value::<GitDiffToRemoteToolParam>(v).ok())
+        {
+            Some(p) => p,
+            None => {
+                let result = CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        r#type: "text".to_string(),
+                        text: "gitDiffToRemote: missing or invalid `cwd`".to_string(),
+                        annotations: None,
+                    })],
+                    is_error: Some(true),
+                    structured_content: None,
+                };
+                self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                    .await;
+                return;
+            }
+        };
+
+        let diff = git_diff_to_remote(&PathBuf::from(params.cwd)).await;
+        match diff {
+            Some(v) => {
+                let result = CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        r#type: "text".to_string(),
+                        text: "git diff attached in structured_content".to_string(),
+                        annotations: None,
+                    })],
+                    is_error: Some(false),
+                    structured_content: Some(json!({ "sha": v.sha, "diff": v.diff })),
+                };
+                self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                    .await;
+            }
+            None => {
+                let result = CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        r#type: "text".to_string(),
+                        text: "failed to compute git diff to remote".to_string(),
+                        annotations: None,
+                    })],
+                    is_error: Some(true),
+                    structured_content: None,
+                };
+                self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                    .await;
+            }
+        }
+    }
+
+    async fn handle_tool_apply_patch(&self, request_id: RequestId, arguments: Option<Value>) {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            patch: String,
+            #[allow(dead_code)]
+            cwd: Option<String>,
+        }
+
+        let Args { patch, cwd } =
+            match arguments.and_then(|v| serde_json::from_value::<Args>(v).ok()) {
+                Some(a) => a,
+                None => {
+                    let result = CallToolResult {
+                        content: vec![ContentBlock::TextContent(TextContent {
+                            r#type: "text".to_string(),
+                            text: "applyPatch: require { patch: string }".to_string(),
+                            annotations: None,
+                        })],
+                        is_error: Some(true),
+                        structured_content: None,
+                    };
+                    self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                        .await;
+                    return;
+                }
+            };
+
+        // Build an exec invocation that calls the current executable with the
+        // secret CODEX_APPLY_PATCH_ARG1 flag so the arg0 path applies the patch
+        // with the same sandbox enforcement as other execs.
+        let path_to_codex = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(_) => {
+                let result = CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        r#type: "text".to_string(),
+                        text: "applyPatch: failed to resolve current executable".to_string(),
+                        annotations: None,
+                    })],
+                    is_error: Some(true),
+                    structured_content: None,
+                };
+                self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                    .await;
+                return;
+            }
+        };
+
+        let cfg = self.config.as_ref();
+        let cwd_path = cwd.map(PathBuf::from).unwrap_or_else(|| cfg.cwd.clone());
+        let exec_params = ExecParams {
+            command: vec![
+                path_to_codex.to_string_lossy().to_string(),
+                CODEX_APPLY_PATCH_ARG1.to_string(),
+                patch,
+            ],
+            cwd: cwd_path,
+            timeout_ms: Some(120_000),
+            env: std::collections::HashMap::new(),
+            with_escalated_permissions: None,
+            justification: None,
+        };
+
+        let effective_policy = cfg.sandbox_policy.clone();
+        let sandbox_type = match &effective_policy {
+            codex_core::protocol::SandboxPolicy::DangerFullAccess => {
+                codex_core::exec::SandboxType::None
+            }
+            _ => get_platform_sandbox().unwrap_or(codex_core::exec::SandboxType::None),
+        };
+
+        let outgoing = self.outgoing.clone();
+        let req_id = request_id;
+        let codex_linux_sandbox_exe = self.codex_linux_sandbox_exe.clone();
+        let sandbox_cwd = cfg.cwd.clone();
+
+        tokio::spawn(async move {
+            match codex_core::exec::process_exec_tool_call(
+                exec_params,
+                sandbox_type,
+                &effective_policy,
+                sandbox_cwd.as_path(),
+                &codex_linux_sandbox_exe,
+                None,
+            )
+            .await
+            {
+                Ok(output) => {
+                    let result = CallToolResult {
+                        content: vec![ContentBlock::TextContent(TextContent {
+                            r#type: "text".to_string(),
+                            text: "applyPatch completed (see structured_content)".to_string(),
+                            annotations: None,
+                        })],
+                        is_error: Some(false),
+                        structured_content: Some(json!({
+                            "exit_code": output.exit_code,
+                            "stdout": output.stdout.text,
+                            "stderr": output.stderr.text,
+                        })),
+                    };
+                    outgoing.send_response(req_id, result).await;
+                }
+                Err(err) => {
+                    let result = CallToolResult {
+                        content: vec![ContentBlock::TextContent(TextContent {
+                            r#type: "text".to_string(),
+                            text: format!("applyPatch failed: {err}"),
+                            annotations: None,
+                        })],
+                        is_error: Some(true),
+                        structured_content: None,
+                    };
+                    outgoing.send_response(req_id, result).await;
+                }
+            }
+        });
+    }
+
+    async fn handle_tool_code_search(&self, request_id: RequestId, arguments: Option<Value>) {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            pattern: String,
+            limit: Option<u32>,
+            cwd: Option<String>,
+            exclude: Option<Vec<String>>,
+            compute_indices: Option<bool>,
+        }
+
+        let Args {
+            pattern,
+            limit,
+            cwd,
+            exclude,
+            compute_indices,
+        } = match arguments.and_then(|v| serde_json::from_value::<Args>(v).ok()) {
+            Some(a) => a,
+            None => {
+                let result = CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        r#type: "text".to_string(),
+                        text: "codeSearch: require { pattern: string }".to_string(),
+                        annotations: None,
+                    })],
+                    is_error: Some(true),
+                    structured_content: None,
+                };
+                self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                    .await;
+                return;
+            }
+        };
+
+        let cfg = self.config.as_ref();
+        let search_dir = cwd.map(PathBuf::from).unwrap_or_else(|| cfg.cwd.clone());
+        let limit_nz = std::num::NonZero::new(limit.unwrap_or(200).max(1) as usize)
+            .unwrap_or(std::num::NonZero::new(200usize).unwrap());
+        let threads_nz = std::num::NonZero::new(4usize).unwrap();
+        let exclude = exclude.unwrap_or_default();
+        let compute_indices = compute_indices.unwrap_or(false);
+
+        // codex-file-search uses an AtomicBool cancel flag; create one.
+        let cancel_atomic = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let res = file_search::run(
+            &pattern,
+            limit_nz,
+            &search_dir,
+            exclude,
+            threads_nz,
+            cancel_atomic,
+            compute_indices,
+        );
+
+        match res {
+            Ok(r) => {
+                let matches: Vec<serde_json::Value> = r
+                    .matches
+                    .into_iter()
+                    .map(|m| {
+                        let indices = m.indices.map(|idx| {
+                            idx.into_iter()
+                                .map(serde_json::Value::from)
+                                .collect::<Vec<_>>()
+                        });
+                        json!({
+                            "path": m.path,
+                            "score": m.score,
+                            "indices": indices,
+                        })
+                    })
+                    .collect();
+                let result = CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        r#type: "text".to_string(),
+                        text: format!(
+                            "{} matches (showing up to {}): codeSearch completed",
+                            r.total_match_count, limit_nz
+                        ),
+                        annotations: None,
+                    })],
+                    is_error: Some(false),
+                    structured_content: Some(json!({
+                        "total": r.total_match_count,
+                        "matches": matches,
+                    })),
+                };
+                self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                    .await;
+            }
+            Err(err) => {
+                let result = CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        r#type: "text".to_string(),
+                        text: format!("codeSearch failed: {err}"),
+                        annotations: None,
+                    })],
+                    is_error: Some(true),
+                    structured_content: None,
+                };
+                self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                    .await;
+            }
+        }
+    }
+
+    async fn handle_tool_read_file(&self, request_id: RequestId, arguments: Option<Value>) {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            path: String,
+            start: Option<u64>,
+            max_bytes: Option<u64>,
+        }
+
+        let Args {
+            path,
+            start,
+            max_bytes,
+        } = match arguments.and_then(|v| serde_json::from_value::<Args>(v).ok()) {
+            Some(a) => a,
+            None => {
+                let result = CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        r#type: "text".to_string(),
+                        text: "readFile: require { path: string }".to_string(),
+                        annotations: None,
+                    })],
+                    is_error: Some(true),
+                    structured_content: None,
+                };
+                self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                    .await;
+                return;
+            }
+        };
+
+        let cfg = self.config.as_ref();
+        let root = match std::fs::canonicalize(&cfg.cwd) {
+            Ok(p) => p,
+            Err(err) => {
+                let result = CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        r#type: "text".to_string(),
+                        text: format!("readFile: failed to resolve workspace root: {err}"),
+                        annotations: None,
+                    })],
+                    is_error: Some(true),
+                    structured_content: None,
+                };
+                self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                    .await;
+                return;
+            }
+        };
+
+        // Resolve candidate path relative to root if needed, then canonicalize.
+        let cand = {
+            let p = PathBuf::from(&path);
+            if p.is_absolute() { p } else { root.join(p) }
+        };
+        let target = match std::fs::canonicalize(&cand) {
+            Ok(p) => p,
+            Err(err) => {
+                let result = CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        r#type: "text".to_string(),
+                        text: format!("readFile: path not found or invalid: {err}"),
+                        annotations: None,
+                    })],
+                    is_error: Some(true),
+                    structured_content: None,
+                };
+                self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                    .await;
+                return;
+            }
+        };
+
+        // Enforce workspace boundary.
+        if !target.starts_with(&root) {
+            let result = CallToolResult {
+                content: vec![ContentBlock::TextContent(TextContent {
+                    r#type: "text".to_string(),
+                    text: "readFile: path must be inside the workspace root".to_string(),
+                    annotations: None,
+                })],
+                is_error: Some(true),
+                structured_content: None,
+            };
+            self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                .await;
+            return;
+        }
+
+        // Read and slice.
+        let max_cap: u64 = 5_000_000; // 5MB cap
+        let default_max: u64 = 200_000; // 200KB default
+        let max_read = max_bytes.unwrap_or(default_max).min(max_cap) as usize;
+        let start_off = start.unwrap_or(0) as usize;
+
+        let bytes = match std::fs::read(&target) {
+            Ok(b) => b,
+            Err(err) => {
+                let result = CallToolResult {
+                    content: vec![ContentBlock::TextContent(TextContent {
+                        r#type: "text".to_string(),
+                        text: format!("readFile: failed to read file: {err}"),
+                        annotations: None,
+                    })],
+                    is_error: Some(true),
+                    structured_content: None,
+                };
+                self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                    .await;
+                return;
+            }
+        };
+
+        let total = bytes.len();
+        let start_off = start_off.min(total);
+        let end = (start_off + max_read).min(total);
+        let slice = &bytes[start_off..end];
+
+        let (body, encoding) = match std::str::from_utf8(slice) {
+            Ok(s) => (json!({"text": s}), "utf-8".to_string()),
+            Err(_) => (
+                json!({"base64": base64::engine::general_purpose::STANDARD.encode(slice)}),
+                "base64".to_string(),
+            ),
+        };
+
+        let result = CallToolResult {
+            content: vec![ContentBlock::TextContent(TextContent {
+                r#type: "text".to_string(),
+                text: format!(
+                    "readFile: {} bytes from {} (offset {} of {})",
+                    slice.len(),
+                    target.display(),
+                    start_off,
+                    total
+                ),
+                annotations: None,
+            })],
+            is_error: Some(false),
+            structured_content: Some(json!({
+                "path": target.to_string_lossy(),
+                "encoding": encoding,
+                "start": start_off,
+                "read_bytes": slice.len(),
+                "total_bytes": total,
+                "content": body,
+            })),
+        };
+        self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+            .await;
     }
     async fn handle_tool_call_codex(&self, id: RequestId, arguments: Option<serde_json::Value>) {
         let (initial_prompt, config): (String, Config) = match arguments {
