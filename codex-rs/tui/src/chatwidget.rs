@@ -413,6 +413,11 @@ impl ChatWidget {
     fn on_error(&mut self, message: String) {
         self.finalize_turn();
         self.add_to_history(history_cell::new_error_event(message));
+        // If a client-only planning session was in progress, clear it to avoid
+        // accidentally resuming on the next unrelated task completion.
+        self.planning_state = None;
+        self.pending_planner_model = None;
+        self.pending_reviewer_model = None;
         self.request_redraw();
 
         // After an error ends the turn, try sending the next queued input.
@@ -425,6 +430,12 @@ impl ChatWidget {
     fn on_interrupted_turn(&mut self, reason: TurnAbortReason) {
         // Finalize, log a gentle prompt, and clear running state.
         self.finalize_turn();
+
+        // Defensive: reset planning state when user interrupts a turn to avoid
+        // resuming orchestration on a subsequent, unrelated turn completion.
+        self.planning_state = None;
+        self.pending_planner_model = None;
+        self.pending_reviewer_model = None;
 
         if reason != TurnAbortReason::ReviewEnded {
             self.add_to_history(history_cell::new_error_event(
@@ -1264,9 +1275,7 @@ impl ChatWidget {
             let task_text = if user_notes.trim().is_empty() {
                 DEFAULT_PLANNING_TASK.to_string()
             } else {
-                format!(
-                    "{DEFAULT_PLANNING_TASK}\n\nAdditional user notes:\n{user_notes}"
-                )
+                format!("{DEFAULT_PLANNING_TASK}\n\nAdditional user notes:\n{user_notes}")
             };
             let prompt = format!(
                 "{PLANNER_PROMPT_BASE}\n\n---\n\nTask: {task_text}\n\nStart by outlining a plan. If you need to inspect files, do so briefly and only as needed."

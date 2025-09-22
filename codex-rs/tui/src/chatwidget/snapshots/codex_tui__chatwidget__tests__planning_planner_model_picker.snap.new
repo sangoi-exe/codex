@@ -1,0 +1,16 @@
+---
+source: tui/src/chatwidget/tests.rs
+assertion_line: 1622
+expression: terminal.backend()
+---
+"                                                                                "
+"▌ Select planner model                                                          "
+"▌ Search models                                                                 "
+"▌                                                                               "
+"▌ > 1. gpt-5 minimal (current)                                                  "
+"▌   2. gpt-5 low (current)                                                      "
+"▌   3. gpt-5 medium (current)                                                   "
+"▌   4. gpt-5 high (current)                                                     "
+"                                                                                "
+"Enter to confirm, Esc to cancel                                                 "
+"                                                                                "

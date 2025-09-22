@@ -1,0 +1,16 @@
+---
+source: tui/src/chatwidget/tests.rs
+assertion_line: 1638
+expression: terminal.backend()
+---
+"                                                                                "
+"▌ Select reviewer model                                                         "
+"▌ Search models                                                                 "
+"▌                                                                               "
+"▌ > 1. gpt-5 minimal                                                            "
+"▌   2. gpt-5 low                                                                "
+"▌   3. gpt-5 medium                                                             "
+"▌   4. gpt-5 high                                                               "
+"                                                                                "
+"Enter to confirm, Esc to cancel                                                 "
+"                                                                                "

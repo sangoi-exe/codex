@@ -1607,6 +1607,37 @@ fn status_widget_active_snapshot() {
     assert_snapshot!("status_widget_active", terminal.backend());
 }
 
+// Snapshot test: planning (client-only) planner model picker popup
+#[test]
+fn planning_planner_model_picker_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.open_planning_models_popup();
+    let height = chat.desired_height(80);
+    let mut terminal = Terminal::new(TestBackend::new(80, height)).expect("terminal");
+    terminal
+        .draw(|f| f.render_widget_ref(&chat, f.area()))
+        .expect("draw planning planner picker");
+    assert_snapshot!("planning_planner_model_picker", terminal.backend());
+}
+
+// Snapshot test: planning (client-only) reviewer model picker popup
+#[test]
+fn planning_reviewer_model_picker_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    // This will set the planner and open the reviewer model picker.
+    chat.on_planning_set_planner_model("gpt-5".to_string());
+    let height = chat.desired_height(80);
+    let mut terminal = Terminal::new(TestBackend::new(80, height)).expect("terminal");
+    terminal
+        .draw(|f| f.render_widget_ref(&chat, f.area()))
+        .expect("draw planning reviewer picker");
+    assert_snapshot!("planning_reviewer_model_picker", terminal.backend());
+}
+
 #[test]
 fn apply_patch_events_emit_history_cells() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
