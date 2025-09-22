@@ -79,4 +79,11 @@ pub(crate) enum AppEvent {
 
     /// Open the top-level review presets popup.
     OpenReviewPopup,
+
+    /// Planning flow (alt to subagents): choose two models and a task.
+    OpenPlanningModelsPopup,
+    /// User selected the Planner model (model slug).
+    PlanningSetPlannerModel(String),
+    /// User selected the Reviewer model (model slug).
+    PlanningSetReviewerModel(String),
 }

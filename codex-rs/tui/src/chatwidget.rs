@@ -100,6 +100,7 @@ use codex_common::model_presets::builtin_model_presets;
 use codex_core::AuthManager;
 use codex_core::ConversationManager;
 use codex_core::protocol::AskForApproval;
+use codex_core::protocol::PlanningRequest;
 use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol_config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_file_search::FileMatch;
@@ -193,6 +194,9 @@ pub(crate) struct ChatWidget {
     pending_notification: Option<Notification>,
     // Simple review mode flag; used to adjust layout and banners.
     is_review_mode: bool,
+    // Temporary storage for planning flow
+    pending_planner_model: Option<String>,
+    pending_reviewer_model: Option<String>,
 }
 
 struct UserMessage {
@@ -774,6 +778,8 @@ impl ChatWidget {
             suppress_session_configured_redraw: false,
             pending_notification: None,
             is_review_mode: false,
+            pending_planner_model: None,
+            pending_reviewer_model: None,
         }
     }
 
@@ -833,6 +839,8 @@ impl ChatWidget {
             suppress_session_configured_redraw: true,
             pending_notification: None,
             is_review_mode: false,
+            pending_planner_model: None,
+            pending_reviewer_model: None,
         }
     }
 
@@ -950,6 +958,9 @@ impl ChatWidget {
             SlashCommand::Review => {
                 self.open_review_popup();
             }
+            SlashCommand::Planning => {
+                self.app_event_tx.send(AppEvent::OpenPlanningModelsPopup);
+            }
             SlashCommand::Model => {
                 self.open_model_popup();
             }
@@ -1033,6 +1044,130 @@ impl ChatWidget {
                 }));
             }
         }
+    }
+
+    pub(crate) fn open_planning_models_popup(&mut self) {
+        use crate::bottom_pane::SelectionItem;
+        use crate::bottom_pane::SelectionViewParams;
+        let current_model = self.config.model.clone();
+        let auth_mode = self.auth_manager.auth().map(|auth| auth.mode);
+        let presets: Vec<ModelPreset> = builtin_model_presets(auth_mode);
+        let mut items: Vec<SelectionItem> = Vec::new();
+        for preset in presets.iter() {
+            let label = preset.label.to_string();
+            let model = preset.model.to_string();
+            let is_current = model == current_model;
+            let action: crate::bottom_pane::SelectionAction = Box::new({
+                let model2 = model.clone();
+                move |tx: &AppEventSender| {
+                    tx.send(AppEvent::PlanningSetPlannerModel(model2.clone()));
+                }
+            });
+            items.push(SelectionItem {
+                name: label,
+                description: None,
+                is_current,
+                actions: vec![action],
+                dismiss_on_select: true,
+                search_value: Some(model.clone()),
+            });
+        }
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: "Select planner model".to_string(),
+            subtitle: None,
+            footer_hint: Some("Enter to confirm, Esc to cancel".to_string()),
+            items,
+            is_searchable: true,
+            search_placeholder: Some("Search models".to_string()),
+            on_escape: None,
+        });
+        self.pending_planner_model = None;
+        self.pending_reviewer_model = None;
+    }
+
+    pub(crate) fn on_planning_set_planner_model(&mut self, model: String) {
+        self.pending_planner_model = Some(model);
+        self.open_planning_reviewer_model_picker();
+    }
+
+    fn open_planning_reviewer_model_picker(&mut self) {
+        use crate::bottom_pane::SelectionItem;
+        use crate::bottom_pane::SelectionViewParams;
+        let current_model = self.config.review_model.clone();
+        let auth_mode = self.auth_manager.auth().map(|auth| auth.mode);
+        let presets: Vec<ModelPreset> = builtin_model_presets(auth_mode);
+        let mut items: Vec<SelectionItem> = Vec::new();
+        for preset in presets.iter() {
+            let label = preset.label.to_string();
+            let model = preset.model.to_string();
+            let is_current = model == current_model;
+            let action: crate::bottom_pane::SelectionAction = Box::new({
+                let model2 = model.clone();
+                move |tx: &AppEventSender| {
+                    tx.send(AppEvent::PlanningSetReviewerModel(model2.clone()));
+                }
+            });
+            items.push(SelectionItem {
+                name: label,
+                description: None,
+                is_current,
+                actions: vec![action],
+                dismiss_on_select: true,
+                search_value: Some(model.clone()),
+            });
+        }
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: "Select reviewer model".to_string(),
+            subtitle: None,
+            footer_hint: Some("Enter to confirm, Esc to cancel".to_string()),
+            items,
+            is_searchable: true,
+            search_placeholder: Some("Search models".to_string()),
+            on_escape: None,
+        });
+    }
+
+    pub(crate) fn on_planning_set_reviewer_model(&mut self, model: String) {
+        self.pending_reviewer_model = Some(model);
+        // Show a prompt to enter the task
+        self.open_planning_task_prompt();
+    }
+
+    fn open_planning_task_prompt(&mut self) {
+        use crate::bottom_pane::custom_prompt_view::CustomPromptView;
+        let planner = self
+            .pending_planner_model
+            .clone()
+            .unwrap_or_else(|| self.config.model.clone());
+        let reviewer = self
+            .pending_reviewer_model
+            .clone()
+            .unwrap_or_else(|| self.config.review_model.clone());
+        let planner_label = planner.clone();
+        let reviewer_label = reviewer.clone();
+        let tx = self.app_event_tx.clone();
+        let on_submit: crate::bottom_pane::custom_prompt_view::PromptSubmitted =
+            Box::new(move |text: String| {
+                tx.send(AppEvent::CodexOp(Op::Planning {
+                    request: PlanningRequest {
+                        planner_model: planner.clone(),
+                        reviewer_model: reviewer.clone(),
+                        task_prompt: text,
+                    },
+                }));
+            });
+        let context_label = Some(format!(
+            "Planner: {planner_label} | Reviewer: {reviewer_label}"
+        ));
+        let view = CustomPromptView::new(
+            "Planning task".to_string(),
+            "Describe the task to plan".to_string(),
+            context_label,
+            self.app_event_tx.clone(),
+            None,
+            on_submit,
+        );
+        self.bottom_pane.show_view(Box::new(view));
     }
 
     pub(crate) fn handle_paste(&mut self, text: String) {
@@ -1223,6 +1358,29 @@ impl ChatWidget {
                 self.on_entered_review_mode(review_request)
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
+            EventMsg::EnteredPlanningMode(req) => {
+                let banner = format!(
+                    ">> Planning started (planner: {}, reviewer: {}) <<",
+                    req.planner_model, req.reviewer_model
+                );
+                self.add_to_history(history_cell::new_review_status_line(banner));
+                self.request_redraw();
+            }
+            EventMsg::ExitedPlanningMode(ev) => {
+                // Flush stream, then show final plan as agent message
+                self.flush_answer_stream_with_separator();
+                self.flush_interrupt_queue();
+                self.flush_active_exec_cell();
+                let mut message_lines: Vec<ratatui::text::Line<'static>> = Vec::new();
+                append_markdown(&ev.plan_text, &mut message_lines, &self.config);
+                let body_cell = AgentMessageCell::new(message_lines, true);
+                self.app_event_tx
+                    .send(AppEvent::InsertHistoryCell(Box::new(body_cell)));
+                self.add_to_history(history_cell::new_review_status_line(
+                    "<< Planning finished >>".to_string(),
+                ));
+                self.request_redraw();
+            }
         }
     }
 

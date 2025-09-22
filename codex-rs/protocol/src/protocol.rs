@@ -171,6 +171,9 @@ pub enum Op {
     /// Request a code review from the agent.
     Review { review_request: ReviewRequest },
 
+    /// Multi-turn planning with two models (planner and reviewer).
+    Planning { request: PlanningRequest },
+
     /// Request to shut down codex instance.
     Shutdown,
 }
@@ -516,11 +519,31 @@ pub enum EventMsg {
 
     /// Exited review mode with an optional final result to apply.
     ExitedReviewMode(ExitedReviewModeEvent),
+
+    /// Entered planning mode with a task and two models.
+    EnteredPlanningMode(PlanningRequest),
+
+    /// Exited planning mode with the final plan text.
+    ExitedPlanningMode(PlanningOutputEvent),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
 pub struct ExitedReviewModeEvent {
     pub review_output: Option<ReviewOutputEvent>,
+}
+
+/// Request payload for two-model planning.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, TS)]
+pub struct PlanningRequest {
+    pub planner_model: String,
+    pub reviewer_model: String,
+    pub task_prompt: String,
+}
+
+/// Combined planning output returned by the core.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, TS)]
+pub struct PlanningOutputEvent {
+    pub plan_text: String,
 }
 
 // Individual event payload types matching each `EventMsg` variant.

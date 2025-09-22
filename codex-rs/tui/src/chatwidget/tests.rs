@@ -338,6 +338,8 @@ fn make_chatwidget_manual() -> (
         suppress_session_configured_redraw: false,
         pending_notification: None,
         is_review_mode: false,
+        pending_planner_model: None,
+        pending_reviewer_model: None,
     };
     (widget, rx, op_rx)
 }

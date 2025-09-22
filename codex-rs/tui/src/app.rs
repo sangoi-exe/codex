@@ -366,6 +366,15 @@ impl App {
             AppEvent::OpenReviewPopup => {
                 self.chat_widget.open_review_popup();
             }
+            AppEvent::OpenPlanningModelsPopup => {
+                self.chat_widget.open_planning_models_popup();
+            }
+            AppEvent::PlanningSetPlannerModel(model) => {
+                self.chat_widget.on_planning_set_planner_model(model);
+            }
+            AppEvent::PlanningSetReviewerModel(model) => {
+                self.chat_widget.on_planning_set_reviewer_model(model);
+            }
         }
         Ok(true)
     }

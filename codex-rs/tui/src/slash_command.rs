@@ -15,6 +15,7 @@ pub enum SlashCommand {
     Model,
     Approvals,
     Review,
+    Planning,
     New,
     Init,
     Compact,
@@ -37,6 +38,9 @@ impl SlashCommand {
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
             SlashCommand::Review => "review my changes and find issues",
+            SlashCommand::Planning => {
+                "multi-turn planning: pick planner+reviewer models and enter a task"
+            }
             SlashCommand::Quit => "exit Codex",
             SlashCommand::Diff => "show git diff (including untracked files)",
             SlashCommand::Mention => "mention a file",
@@ -66,6 +70,7 @@ impl SlashCommand {
             | SlashCommand::Model
             | SlashCommand::Approvals
             | SlashCommand::Review
+            | SlashCommand::Planning
             | SlashCommand::Logout => false,
             SlashCommand::Diff
             | SlashCommand::Mention
