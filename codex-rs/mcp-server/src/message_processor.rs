@@ -296,11 +296,13 @@ impl MessageProcessor {
         params: <mcp_types::ListToolsRequest as mcp_types::ModelContextProtocolRequest>::Params,
     ) {
         tracing::trace!("tools/list -> {params:?}");
+        let mut tools = vec![
+            create_tool_for_codex_tool_call_param(),
+            create_tool_for_codex_tool_call_reply_param(),
+        ];
+        tools.extend(crate::proxy::list_tools());
         let result = ListToolsResult {
-            tools: vec![
-                create_tool_for_codex_tool_call_param(),
-                create_tool_for_codex_tool_call_reply_param(),
-            ],
+            tools,
             next_cursor: None,
         };
 
@@ -323,17 +325,23 @@ impl MessageProcessor {
                     .await
             }
             _ => {
-                let result = CallToolResult {
-                    content: vec![ContentBlock::TextContent(TextContent {
-                        r#type: "text".to_string(),
-                        text: format!("Unknown tool '{name}'"),
-                        annotations: None,
-                    })],
-                    is_error: Some(true),
-                    structured_content: None,
-                };
-                self.send_response::<mcp_types::CallToolRequest>(id, result)
-                    .await;
+                if name.starts_with("chatgpt.") {
+                    let result = crate::proxy::dispatch(&name, arguments).await;
+                    self.send_response::<mcp_types::CallToolRequest>(id, result)
+                        .await;
+                } else {
+                    let result = CallToolResult {
+                        content: vec![ContentBlock::TextContent(TextContent {
+                            r#type: "text".to_string(),
+                            text: format!("Unknown tool '{name}'"),
+                            annotations: None,
+                        })],
+                        is_error: Some(true),
+                        structured_content: None,
+                    };
+                    self.send_response::<mcp_types::CallToolRequest>(id, result)
+                        .await;
+                }
             }
         }
     }

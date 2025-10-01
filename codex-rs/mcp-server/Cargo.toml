@@ -21,7 +21,9 @@ codex-common = { workspace = true, features = ["cli"] }
 codex-core = { workspace = true }
 codex-protocol = { workspace = true }
 codex-utils-json-to-toml = { workspace = true }
+codex-apply-patch = { workspace = true }
 mcp-types = { workspace = true }
+chrono = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

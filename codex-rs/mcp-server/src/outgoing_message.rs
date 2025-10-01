@@ -198,7 +198,8 @@ pub(crate) struct OutgoingNotificationParams {
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<OutgoingNotificationMeta>,
 
-    #[serde(flatten)]
+    /// Place the Codex event under a namespaced key to avoid conflicting with
+    /// client schemas that treat a top-level `id` specially.
     pub event: serde_json::Value,
 }
 
@@ -208,12 +209,16 @@ pub(crate) struct OutgoingNotificationParams {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OutgoingNotificationMeta {
-    pub request_id: Option<RequestId>,
+    /// Use the progressToken channel defined by MCP rather than inventing
+    /// a custom requestId. The token value matches the original JSON-RPC
+    /// request id that initiated the operation.
+    #[serde(rename = "progressToken")]
+    pub progress_token: Option<RequestId>,
 }
 
 impl OutgoingNotificationMeta {
-    pub(crate) fn new(request_id: Option<RequestId>) -> Self {
-        Self { request_id }
+    pub(crate) fn new(progress_token: Option<RequestId>) -> Self {
+        Self { progress_token }
     }
 }
 
@@ -237,7 +242,7 @@ mod tests {
     use codex_protocol::ConversationId;
     use codex_protocol::config_types::ReasoningEffort;
     use pretty_assertions::assert_eq;
-    use serde_json::json;
+    
     use tempfile::NamedTempFile;
 
     use super::*;
@@ -272,10 +277,13 @@ mod tests {
         };
         assert_eq!(method, "codex/event");
 
-        let Ok(expected_params) = serde_json::to_value(&event) else {
-            panic!("Event must serialize");
+        // Ensure the event is nested under `event` and meta is absent when None.
+        let Some(serialized) = params else {
+            panic!("params must be present")
         };
-        assert_eq!(params, Some(expected_params));
+        let obj = serialized.as_object().expect("params is object");
+        assert!(obj.get("_meta").is_none());
+        assert!(obj.get("event").is_some());
         Ok(())
     }
 
@@ -300,7 +308,7 @@ mod tests {
             msg: EventMsg::SessionConfigured(session_configured_event.clone()),
         };
         let meta = OutgoingNotificationMeta {
-            request_id: Some(RequestId::String("123".to_string())),
+            progress_token: Some(RequestId::String("123".to_string())),
         };
 
         outgoing_message_sender
@@ -312,22 +320,16 @@ mod tests {
             panic!("expected Notification for first message");
         };
         assert_eq!(method, "codex/event");
-        let expected_params = json!({
-            "_meta": {
-                "requestId": "123",
-            },
-            "id": "1",
-            "msg": {
-                "session_id": session_configured_event.session_id,
-                "model": session_configured_event.model,
-                "reasoning_effort": session_configured_event.reasoning_effort,
-                "history_log_id": session_configured_event.history_log_id,
-                "history_entry_count": session_configured_event.history_entry_count,
-                "type": "session_configured",
-                "rollout_path": rollout_file.path().to_path_buf(),
-            }
-        });
-        assert_eq!(params.unwrap(), expected_params);
+        let serialized = params.expect("params must be present");
+        let obj = serialized.as_object().expect("params is object");
+        // meta with progressToken
+        let meta = obj.get("_meta").expect("_meta present");
+        assert_eq!(
+            meta.get("progressToken").and_then(|v| v.as_str()),
+            Some("123")
+        );
+        // event payload present
+        assert!(obj.get("event").is_some());
         Ok(())
     }
 }

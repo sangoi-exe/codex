@@ -27,6 +27,7 @@ mod exec_approval;
 pub(crate) mod message_processor;
 mod outgoing_message;
 mod patch_approval;
+mod proxy;
 
 use crate::message_processor::MessageProcessor;
 use crate::outgoing_message::OutgoingMessage;
